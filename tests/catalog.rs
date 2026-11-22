@@ -231,3 +231,74 @@ fn build_dependency_uses_the_scope_of_the_selected_suite() {
     assert!(stdout.contains("Killed\tsurvivor"), "{stdout}");
     assert!(stdout.contains("2 literal builds"), "{stdout}");
 }
+
+#[test]
+fn workspace_coverage_keeps_downstream_kills_and_falls_back_for_doctests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    setup(root);
+    fs::write(root.join("Cargo.toml"), "[package]\nname='sample'\nversion='0.1.0'\nedition='2021'\n[workspace]\nmembers=['sink']\n").unwrap();
+    let names = ["integration", "unused", "documented", "exercised"];
+    let mut code = String::new();
+    let mut catalog = Vec::new();
+    for (i, name) in names.into_iter().enumerate() {
+        let line = format!("pub fn {name}()->u32 {{ 1 }}\n");
+        let col = line.find('1').unwrap() + 1;
+        catalog.push(
+            json!({"name":name,"package":"sample","file":"src/lib.rs","replacement":"2",
+            "span":{"start":{"line":i+1,"column":col},"end":{"line":i+1,"column":col+1}}}),
+        );
+        code.push_str(&line);
+    }
+    fs::write(root.join("src/lib.rs"), code).unwrap();
+    fs::write(
+        root.join("catalog.json"),
+        serde_json::to_vec(&catalog).unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("sink/src")).unwrap();
+    fs::create_dir_all(root.join("sink/tests")).unwrap();
+    fs::write(root.join("sink/Cargo.toml"), "[package]\nname='sink'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nsample={path='..'}\n").unwrap();
+    fs::write(
+        root.join("sink/src/lib.rs"),
+        "/// ```\n/// assert_eq!(sample::documented(), 1);\n/// ```\npub struct Example;\n",
+    )
+    .unwrap();
+    fs::write(root.join("sink/tests/downstream.rs"), "#[test] fn check(){std::hint::black_box(sample::exercised());assert_eq!(sample::integration(),1);}").unwrap();
+    fs::write(root.join("tests/check.rs"), r#"#[test] fn unrelated(){
+        if let Ok(id)=std::env::var("CARGO_ONLINE_MUTANT") {
+            std::fs::write(std::path::PathBuf::from(std::env::var_os("WITNESS").unwrap()).join(id), "").unwrap();
+        }
+    }"#).unwrap();
+    let out = command(root)
+        .env("WITNESS", root)
+        .args(["--test-workspace", "--workspace-coverage"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for result in [
+        "Killed\tintegration",
+        "Uncovered\tunused",
+        "Killed\tdocumented",
+        "Survived\texercised",
+        "4 in 1 shared builds",
+    ] {
+        assert!(stdout.contains(result), "{stdout}");
+    }
+    assert!(
+        root.join("3").exists(),
+        "doctest hit requires the full suite"
+    );
+    for id in ["1", "2", "4"] {
+        assert!(
+            !root.join(id).exists(),
+            "unrelated test ran for mutant {id}"
+        );
+    }
+}

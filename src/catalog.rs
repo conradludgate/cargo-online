@@ -264,8 +264,19 @@ static __CARGO_ONLINE_ID: __cargo_online_std::sync::OnceLock<usize> = __cargo_on
 match *__CARGO_ONLINE_ID.get_or_init(|| {
     if let Some(path) = __cargo_online_std::env::var_os("CARGO_ONLINE_TRACE") {
         use __cargo_online_std::io::Write as _;
-        __cargo_online_std::fs::OpenOptions::new().append(true).open(path).unwrap()
-            .write_all(TRACE_IDS.as_bytes()).unwrap();
+        let mut file = __cargo_online_std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        if __cargo_online_std::env::var_os("CARGO_ONLINE_TRACE_TARGETS").is_some() {
+            let exe = __cargo_online_std::env::current_exe().ok();
+            let name = exe.as_deref().and_then(|p| p.to_str())
+                .filter(|p| !p.contains(['\n','\r','\t'])).unwrap_or("?");
+            let status = __cargo_online_std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let parent = status.lines().find_map(|l| l.strip_prefix("PPid:")).unwrap_or("?").trim();
+            for id in TRACE_IDS.lines() {
+                file.write_all(__cargo_online_std::format!("{id}\t{parent}\t{name}\n").as_bytes()).unwrap();
+            }
+        } else {
+            file.write_all(TRACE_IDS.as_bytes()).unwrap();
+        }
     }
     __cargo_online_std::env::var("CARGO_ONLINE_MUTANT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
 }) {"#;

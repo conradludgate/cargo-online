@@ -3,6 +3,7 @@ mod engine;
 mod host;
 mod instrument;
 mod runner;
+mod workspace_coverage;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};

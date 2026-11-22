@@ -149,10 +149,18 @@ impl Harness {
 }
 
 pub(crate) fn execute(
-    mut cmd: Command,
+    cmd: Command,
     temp: &Path,
     timeout: Duration,
 ) -> Result<(Option<ExitStatus>, String)> {
+    Ok(execute_with_pid(cmd, temp, timeout)?.1)
+}
+
+pub(crate) fn execute_with_pid(
+    mut cmd: Command,
+    temp: &Path,
+    timeout: Duration,
+) -> Result<(u32, (Option<ExitStatus>, String))> {
     cmd.process_group(0);
     let mut log = tempfile::tempfile_in(temp)?;
     let mut child = cmd
@@ -176,5 +184,8 @@ pub(crate) fn execute(
     log.rewind()?;
     let mut buf = Vec::new();
     log.read_to_end(&mut buf)?;
-    Ok((status, String::from_utf8_lossy(&buf).into_owned()))
+    Ok((
+        child.id(),
+        (status, String::from_utf8_lossy(&buf).into_owned()),
+    ))
 }

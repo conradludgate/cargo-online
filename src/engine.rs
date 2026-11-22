@@ -39,6 +39,9 @@ pub struct Options {
     /// Run tests across the whole workspace for each mutation.
     #[arg(long)]
     test_workspace: bool,
+    /// Select workspace test targets using function-entry coverage from the bundle baseline.
+    #[arg(long, requires = "test_workspace", conflicts_with = "full")]
+    workspace_coverage: bool,
     /// Use only the package's library unit tests, selecting covering tests per function.
     #[arg(long)]
     lib: bool,
@@ -107,6 +110,7 @@ impl Engine<'_> {
             .env("CARGO_TARGET_DIR", &self.target)
             .env_remove("CARGO_ONLINE_MUTANT")
             .env_remove("CARGO_ONLINE_TRACE")
+            .env_remove("CARGO_ONLINE_TRACE_TARGETS")
             .arg("test");
         if self.options.test_workspace {
             c.arg("--workspace");
@@ -139,7 +143,9 @@ impl Engine<'_> {
         crate::runner::execute(cmd, self.temp, timeout)
     }
     fn classify(&self, id: Option<usize>) -> Result<Status> {
-        let (status, log) = self.tests(id, self.timeout)?;
+        Self::outcome(self.tests(id, self.timeout)?)
+    }
+    fn outcome((status, log): (Option<ExitStatus>, String)) -> Result<Status> {
         match status {
             Some(s) if s.success() => Ok(Status::Survived),
             None => Ok(Status::Timeout),
@@ -333,21 +339,116 @@ impl Engine<'_> {
                 .collect()
         })
     }
+    fn workspace_results(
+        &self,
+        ids: &[usize],
+        messages: &str,
+        trace: &Path,
+        cargo_pid: u32,
+    ) -> Result<Vec<(usize, Status)>> {
+        use crate::workspace_coverage::{Scope, Target, harnesses, scopes};
+        let full = harnesses(messages)?;
+        let groups = scopes(ids, &fs::read_to_string(trace)?, cargo_pid, &full)?;
+        let mut results = Vec::new();
+        let mut uncovered = 0;
+        let mut filtered = 0;
+        for (scope, group) in groups {
+            if scope == Scope::Uncovered {
+                uncovered += group.len();
+                results.extend(group.into_iter().map(|id| (id, Status::Uncovered)));
+                continue;
+            }
+            let mut selectors = BTreeSet::new();
+            if let Scope::Targets(paths) = scope {
+                selectors.extend(paths.iter().map(|path| full[path].clone()));
+                if self.options.lib {
+                    selectors.remove(&Target::Library);
+                }
+                if !selectors.is_empty() {
+                    // Cargo can resolve a different feature set when target filters
+                    // change. Only replay test binaries present in the original build.
+                    let mut build = self.command();
+                    for target in &selectors {
+                        target.select(&mut build);
+                    }
+                    build.args(["--no-run", "--message-format=json"]);
+                    let (status, log) = crate::runner::execute(
+                        build,
+                        self.temp,
+                        Duration::from_secs(self.options.build_timeout.get() as u64),
+                    )?;
+                    let same_artifacts = status.is_some_and(|s| s.success())
+                        && harnesses(&log).is_ok_and(|selected| {
+                            paths.iter().all(|p| selected.contains_key(p))
+                                && selected.iter().all(|(p, t)| full.get(p) == Some(t))
+                        });
+                    if !same_artifacts {
+                        selectors.clear();
+                    }
+                }
+            }
+            if !selectors.is_empty() {
+                filtered += group.len();
+            }
+            let outcomes = self.pool.install(|| {
+                group
+                    .par_iter()
+                    .map(|&id| {
+                        let mut cmd = self.command();
+                        for target in &selectors {
+                            target.select(&mut cmd);
+                        }
+                        cmd.env("CARGO_ONLINE_MUTANT", (id + 1).to_string());
+                        let outcome =
+                            Self::outcome(crate::runner::execute(cmd, self.temp, self.timeout)?)?;
+                        Ok((id, outcome))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            results.extend(outcomes);
+        }
+        eprintln!(
+            "Workspace coverage: {uncovered} uncovered, {filtered} with target filters, {} with the full suite",
+            ids.len() - uncovered - filtered
+        );
+        Ok(results)
+    }
     fn batch(&self, ids: &[usize], report: &mut Report, literal: &mut Vec<usize>) -> Result<()> {
         self.catalog.bundle(self.root, ids)?;
         // A mutation may be ill-typed or valid only in its original context.
         // Prove viability with its literal edit before reporting it unviable.
         let (status, log) = self.build(true)?;
         let compiled = status.is_some_and(|s| s.success());
-        let usable = compiled && self.classify(None)? == Status::Survived;
+        let (usable, trace) = if compiled && self.options.workspace_coverage {
+            let trace = tempfile::NamedTempFile::new_in(self.temp)?;
+            let mut cmd = self.command();
+            cmd.env("CARGO_ONLINE_TRACE", trace.path())
+                .env("CARGO_ONLINE_TRACE_TARGETS", "1");
+            let (pid, result) = crate::runner::execute_with_pid(cmd, self.temp, self.timeout)?;
+            (
+                Self::outcome(result)? == Status::Survived,
+                Some((pid, trace)),
+            )
+        } else {
+            (compiled && self.classify(None)? == Status::Survived, None)
+        };
         let suspects = if compiled {
             BTreeSet::new()
         } else {
             self.diagnostic_variants(log.as_bytes(), ids)?
         };
         if usable {
-            let selected = if self.options.lib && !self.options.full && !self.options.test_workspace
-            {
+            let selected = if let Some((pid, trace)) = &trace {
+                match self.workspace_results(ids, &log, trace.path(), *pid) {
+                    Ok(results) => Some(results),
+                    Err(err) => {
+                        eprintln!(
+                            "Running the whole workspace suite after target selection failed: {err:#}"
+                        );
+                        None
+                    }
+                }
+            } else if self.options.lib && !self.options.full && !self.options.test_workspace {
                 match self.selected(ids, log.as_bytes()) {
                     Ok(outcomes) => Some(outcomes),
                     Err(error) => {
