@@ -51,6 +51,22 @@ The command copies the workspace to a temporary session under Cargo's target dir
 
 ### Rustyguard benchmark
 
+#### Full cargo-mutants catalog
+
+On Rustyguard revision `a8a0c62fd639da0e5103989023597539d39ce6d6`, cargo-online and cargo-mutants 27.1.0 agreed on every candidate by name and outcome. Both used the default Cargo test suite, default features, three workers, and a 15-second test timeout on x86-64 Linux with rustc 1.99.1.
+
+| Package | Candidates | Killed | Survived | Unviable | Timed out | Shared compilation |
+|---|---:|---:|---:|---:|---:|---|
+| rustyguard-core | 249 | 65 | 64 | 119 | 1 | 129 candidates in 8 runnable bundles |
+| rustyguard-types | 13 | 4 | 5 | 4 | 0 | 9 candidates in 1 runnable bundle |
+
+One cold-target trial on `rustyguard-core` took **45.122 s** with cargo-online and **48.247 s** with cargo-mutants, with dependencies already downloaded. Cargo-online compiled 120 source edits individually, including all 119 unviable candidates. Both tools waited for the same 15-second timeout. These timings include discovery, building, and testing. The shared-build count includes successful bundles and excludes failed build attempts.
+
+```sh
+cargo online mutate -p rustyguard-core -j 3 --timeout 15
+cargo mutants -p rustyguard-core -j 3 --timeout 15
+```
+
 #### Comparison-only benchmark
 
 On the Rustyguard workspace at `a8a0c62fd639da0e5103989023597539d39ce6d6`, both modes killed the same individual mutants in all three trials. Timings are medians on x86-64 Linux with rustc 1.99.1, a release build of cargo-online, warm dependency artifacts, default test profiles, four workers, and a 45-second per-test timeout. Total time includes the workspace copy, instrumented build, baseline tests, and mutant runs.
