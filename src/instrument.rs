@@ -98,7 +98,26 @@ impl<'ast> Visit<'ast> for Scan {
 }
 
 pub fn instrument(root: &Path, src: &Path, mod_dir: &Path, sites: &mut Vec<Site>) -> Result<()> {
+    visit_source(
+        root,
+        src,
+        mod_dir,
+        sites,
+        &mut std::collections::HashSet::new(),
+    )
+}
+
+fn visit_source(
+    root: &Path,
+    src: &Path,
+    mod_dir: &Path,
+    sites: &mut Vec<Site>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
     let path = root.join(src);
+    if !seen.insert(path.canonicalize()?) {
+        return Ok(());
+    }
     let source = fs::read_to_string(&path)?;
     let syntax = syn::parse_file(&source).with_context(|| format!("parsing {}", src.display()))?;
     let prefix = source.strip_prefix('\u{feff}').map_or(0, |_| 3)
@@ -138,7 +157,7 @@ pub fn instrument(root: &Path, src: &Path, mod_dir: &Path, sites: &mut Vec<Site>
     for dir in scan.modules {
         for file in [dir.with_extension("rs"), dir.join("mod.rs")] {
             if root.join(&file).is_file() {
-                instrument(root, &file, &dir, sites)?;
+                visit_source(root, &file, &dir, sites, seen)?;
                 break;
             }
         }

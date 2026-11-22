@@ -1,3 +1,5 @@
+mod catalog;
+mod engine;
 mod instrument;
 mod runner;
 
@@ -23,22 +25,27 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Run the cargo-mutants catalog using shared builds.
+    Mutate(engine::Options),
     /// Compile comparison mutants together and run affected library unit tests.
-    Mutate {
-        #[arg(short, long)]
-        package: Option<String>,
-        #[arg(long, default_value = "Cargo.toml")]
-        manifest_path: PathBuf,
-        /// Maximum concurrent test processes.
-        #[arg(short, long, default_value_t = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN))]
-        jobs: NonZeroUsize,
-        /// Time limit in seconds per test process.
-        #[arg(long, default_value = "60")]
-        timeout: NonZeroUsize,
-        /// Try every test for each mutant, including tests without observed coverage.
-        #[arg(long)]
-        full: bool,
-    },
+    MutateComparisons(Comparisons),
+}
+
+#[derive(clap::Args)]
+struct Comparisons {
+    #[arg(short, long)]
+    package: Option<String>,
+    #[arg(long, default_value = "Cargo.toml")]
+    manifest_path: PathBuf,
+    /// Maximum concurrent test processes.
+    #[arg(short, long, default_value_t = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN))]
+    jobs: NonZeroUsize,
+    /// Time limit in seconds per test process.
+    #[arg(long, default_value = "60")]
+    timeout: NonZeroUsize,
+    /// Try every test for each mutant, including tests without observed coverage.
+    #[arg(long)]
+    full: bool,
 }
 
 fn cargo() -> Command {
@@ -65,6 +72,17 @@ fn snapshot(root: &Path, dest: &Path, target: &Path) -> Result<()> {
             fs::create_dir(&copy)?;
         } else if entry.file_type().is_file() {
             fs::copy(path, copy)?;
+        } else if entry.file_type().is_symlink() {
+            let resolved = path
+                .canonicalize()
+                .with_context(|| format!("resolving {}", path.display()))?;
+            let relative = resolved.strip_prefix(root).with_context(|| {
+                format!(
+                    "workspace symlink points outside snapshot: {}",
+                    path.display()
+                )
+            })?;
+            std::os::unix::fs::symlink(dest.join(relative), copy)?;
         } else {
             bail!("unsupported workspace file {}", path.display());
         }
@@ -73,13 +91,19 @@ fn snapshot(root: &Path, dest: &Path, target: &Path) -> Result<()> {
 }
 
 fn run(action: Action) -> Result<bool> {
-    let Action::Mutate {
+    match action {
+        Action::Mutate(options) => engine::run(options),
+        Action::MutateComparisons(options) => comparisons(options),
+    }
+}
+fn comparisons(options: Comparisons) -> Result<bool> {
+    let Comparisons {
         package,
         manifest_path,
         jobs,
         timeout,
         full,
-    } = action;
+    } = options;
     let start = Instant::now();
     let manifest = manifest_path.canonicalize()?;
     let output = cargo()

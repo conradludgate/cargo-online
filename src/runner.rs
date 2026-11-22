@@ -68,31 +68,6 @@ impl Harness {
             .process_group(0);
         cmd
     }
-    fn execute(&self, mut cmd: Command) -> Result<(Option<ExitStatus>, String)> {
-        let mut log = tempfile::tempfile_in(&self.temp)?;
-        let mut child = cmd
-            .stdout(log.try_clone()?)
-            .stderr(log.try_clone()?)
-            .spawn()?;
-        let start = Instant::now();
-        let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break Some(status);
-            }
-            if start.elapsed() >= self.timeout {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        if status.is_none() {
-            let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
-            child.wait()?;
-        }
-        log.rewind()?;
-        let mut buf = Vec::new();
-        log.read_to_end(&mut buf)?;
-        Ok((status, String::from_utf8_lossy(&buf).into_owned()))
-    }
     pub fn tests(&self) -> Result<Vec<String>> {
         let list = |ignored| -> Result<Vec<String>> {
             let mut c = self.cmd();
@@ -100,7 +75,7 @@ impl Harness {
             if ignored {
                 c.arg("--ignored");
             }
-            let (status, out) = self.execute(c)?;
+            let (status, out) = execute(c, &self.temp, self.timeout)?;
             ensure!(
                 status.is_some_and(|s| s.success()),
                 "test discovery failed: {out}"
@@ -129,7 +104,7 @@ impl Harness {
             cmd.env("CARGO_ONLINE_TRACE", &path);
         }
         let start = Instant::now();
-        let (status, out) = self.execute(cmd)?;
+        let (status, out) = execute(cmd, &self.temp, self.timeout)?;
         ensure!(
             status.is_some_and(|s| s.success()) && out.contains("1 passed;"),
             "baseline test {name} failed or timed out: {out}"
@@ -159,7 +134,7 @@ impl Harness {
         for (i, t) in tests.iter().enumerate() {
             let mut cmd = self.single(t.name);
             cmd.env("CARGO_ONLINE_MUTANT", id.to_string());
-            let (status, out) = self.execute(cmd)?;
+            let (status, out) = execute(cmd, &self.temp, self.timeout)?;
             match status {
                 None => return Ok((Outcome::Timeout, i + 1, Some(t.name))),
                 Some(s) if s.success() && out.contains("1 passed;") => {}
@@ -171,4 +146,35 @@ impl Harness {
         }
         Ok((Outcome::Survived, tests.len(), None))
     }
+}
+
+pub(crate) fn execute(
+    mut cmd: Command,
+    temp: &Path,
+    timeout: Duration,
+) -> Result<(Option<ExitStatus>, String)> {
+    cmd.process_group(0);
+    let mut log = tempfile::tempfile_in(temp)?;
+    let mut child = cmd
+        .stdout(log.try_clone()?)
+        .stderr(log.try_clone()?)
+        .spawn()?;
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if start.elapsed() >= timeout {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    if status.is_none() {
+        let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+        child.wait()?;
+    }
+    log.rewind()?;
+    let mut buf = Vec::new();
+    log.read_to_end(&mut buf)?;
+    Ok((status, String::from_utf8_lossy(&buf).into_owned()))
 }

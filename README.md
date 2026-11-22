@@ -1,27 +1,57 @@
 # cargo-online
 
-Run comparison mutants against your Rust library's unit tests. `cargo online mutate` builds one instrumented test executable for the package. Each test process activates one mutant, so adding a mutant does not require another Cargo build or link.
+Run the cargo-mutants catalog with shared Rust test builds. Cargo-mutants discovers the edits. Cargo-online compiles and executes them, including candidates that need a separate build.
 
 ## Run mutation tests
 
-From the cargo-online checkout, install with `cargo install --path . --locked`. In the target workspace, run:
+Install both commands from the cargo-online checkout:
 
 ```sh
+cargo install --locked cargo-mutants
+cargo install --locked --path .
+```
+
+From the target workspace:
+
+```sh
+cargo online mutate -p my-library --list
 cargo online mutate -p my-library -j 4
-cargo online mutate -p my-library -j 4 --full
+cargo online mutate -p my-library --test-workspace --all-features
+cargo online mutate -p my-library --lib
+```
+
+The default run uses the selected package's normal `cargo test` suite, including integration tests and doctests. At a virtual workspace root it processes every package in the catalog. `--test-workspace` runs downstream workspace tests as well. Set Cargo features with `--features`, `--all-features`, or `--no-default-features`. Arguments after `--` go to cargo-mutants during discovery, for example `-- --file src/parser.rs`. Execution uses cargo-online's options and Cargo's native test runner.
+
+Each candidate retains its upstream name, source span, and replacement. The engine batches up to 32 edits at a time, compiling alternative function bodies behind a per-process selector. It runs a clean baseline and also tests each runnable bundle with every mutation disabled. `-j` sets the maximum number of concurrent mutant test suites. Adjust `--batch-size` to control the size of each build.
+
+Constants, opaque return types, and other edits that require independent type checking use literal source builds. Build scripts, procedural macros, and their workspace dependencies can execute during compilation. The runner uses literal builds for these packages. When rustc rejects a bundle, diagnostics identify variants to retry separately. The engine splits ambiguous failures into smaller batches and confirms viability with the literal edit before reporting **Unviable**. It reports every catalog candidate, including timeouts. Exit codes are 0 for a completed run containing only killed or unviable mutants, 1 for survivors, uncovered mutants, or timeouts, and 2 for a command, baseline, or infrastructure error.
+
+For library-only feedback, `--lib` records which unit tests entered each mutated function and runs those tests fastest first until a failure. **Uncovered** means no baseline unit test entered the function. `--lib --full` runs the full library unit suite for each mutant. Literal retries always run the selected Cargo suite. The default limits are 120 seconds per suite (per test in coverage mode) and 300 seconds per build, controlled by `--timeout` and `--build-timeout`.
+
+The native Linux runner copies the current workspace and keeps incremental artifacts under Cargo's target directory. Tests within a bundle share the copy. Use `-j 1` for suites that need exclusive access to external resources.
+
+### Comparison-only mode
+
+The original runner flips runtime comparison results and uses the standard library unit-test harness. It can run independently of cargo-mutants:
+
+```sh
+cargo online mutate-comparisons -p my-library -j 4
+cargo online mutate-comparisons -p my-library -j 4 --full
 ```
 
 The default run executes each non-ignored library unit test once to check the baseline and record the comparisons it reaches. For each mutant, it runs the covering tests fastest first and stops at the first failure or timeout. Independent mutants run in parallel. `--full` tries every runnable unit test for each mutant, with the same early exit. Use it to check whether coverage-based selection missed a kill, particularly for nondeterministic tests.
 
 The report gives each comparison's source location, outcome, and the test that killed it or timed out. **Uncovered** means no baseline test reached the comparison. **Survived** means all selected tests passed. The default per-process timeout is 60 seconds and can be set with `--timeout SECONDS`. The command exits with 0 when all mutants are killed, 1 when mutants survive, lack coverage, or time out, and 2 for a build, baseline, or runner error.
 
-### Supported targets
+#### Comparison-only targets
 
-The runner supports native Linux libraries with the standard libtest harness and default Cargo features. It negates the boolean result of equality and ordering comparisons in runtime function bodies, preserving operand evaluation. It follows conventional library modules and skips explicit test functions and `#[cfg(test)]` modules, const functions, macro expansions, and `#[path]` modules. Other conditional compilation can leave inactive sites in the report. Integration tests, doctests, and downstream crates are outside this version's test scope.
+Comparison-only mode supports native Linux libraries with the standard libtest harness and default Cargo features. It negates the boolean result of equality and ordering comparisons in runtime function bodies, preserving operand evaluation. It follows conventional library modules and skips explicit test functions and `#[cfg(test)]` modules, const functions, macro expansions, and `#[path]` modules. Other conditional compilation can leave inactive sites in the report. This mode runs library unit tests.
 
-The command copies the workspace to a temporary session under Cargo's target directory, builds there, and keeps dependency artifacts under `target/cargo-online/build`. The workspace must be self-contained, with regular files and directories. The copy omits Git metadata, scratch directories, and build outputs. Test processes share the copied package directory and inherit the caller's environment. Use `-j 1` for tests that need exclusive access to shared resources.
+The command copies the workspace to a temporary session under Cargo's target directory, builds there, and keeps dependency artifacts under `target/cargo-online/build`. The workspace must be self-contained. Symlinks must resolve inside the workspace. The copy omits Git metadata, scratch directories, and build outputs. Test processes share the copied package directory and inherit the caller's environment. Use `-j 1` for tests that need exclusive access to shared resources.
 
 ### Rustyguard benchmark
+
+#### Comparison-only benchmark
 
 On the Rustyguard workspace at `a8a0c62fd639da0e5103989023597539d39ce6d6`, both modes killed the same individual mutants in all three trials. Timings are medians on x86-64 Linux with rustc 1.99.1, a release build of cargo-online, warm dependency artifacts, default test profiles, four workers, and a 45-second per-test timeout. Total time includes the workspace copy, instrumented build, baseline tests, and mutant runs.
 
@@ -37,13 +67,13 @@ A separate control on `rustyguard-core` compiled each of the 31 negations indivi
 To repeat the bundled measurements from the Rustyguard workspace, run the following pair three times for each package after warming the dependency cache:
 
 ```sh
-cargo online mutate -p rustyguard-core -j 4 --timeout 45
-cargo online mutate -p rustyguard-core -j 4 --timeout 45 --full
+cargo online mutate-comparisons -p rustyguard-core -j 4 --timeout 45
+cargo online mutate-comparisons -p rustyguard-core -j 4 --timeout 45 --full
 ```
 
 ## Longer-term design
 
-The long-term goal is an incremental Rust development compiler and test engine: rebuild only what changed, automatically run impacted tests, and share compiler analysis and machine code across mutation variants. The sections below describe the proposed compiler and watch architecture. The current mutation command uses source instrumentation and libtest.
+The long-term goal is an incremental Rust development compiler and test engine: rebuild only what changed, automatically run impacted tests, and share compiler analysis and machine code across mutation variants. The sections below describe the proposed compiler and watch architecture. The current mutation engine uses source instrumentation and Cargo test builds.
 
 ## The developer experience
 
@@ -68,7 +98,7 @@ For exhaustive validation, explicitly ask for the full suite; the selective mode
 
 ```sh
 cargo online test --all           # proposed
-cargo online mutate               # implemented for library unit tests
+cargo online mutate               # implemented for the cargo-mutants catalog
 cargo online mutate --changed     # proposed: mutation analysis of changed code
 ```
 

@@ -19,7 +19,7 @@ fn run(root: &Path, args: &[&str]) -> Output {
         .current_dir(root)
         .env_remove("CARGO_TARGET_DIR")
         .env("CARGO_NET_OFFLINE", "true")
-        .args(["online", "mutate", "-j2"])
+        .args(["online", "mutate-comparisons", "-j2"])
         .args(args)
         .output()
         .unwrap()
