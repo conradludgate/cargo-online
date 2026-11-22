@@ -2,6 +2,7 @@ use crate::{
     cargo,
     catalog::{Candidate, Catalog},
     snapshot,
+    workspace_coverage::{Harnesses, harnesses},
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
@@ -83,11 +84,13 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const WORKSPACE_BASELINE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 struct Baseline {
+    libraries_first: bool,
     artifacts: Option<crate::host::Build>,
     timeout: Duration,
 }
 
 struct Engine<'a> {
+    libraries_first: bool,
     timeout: Duration,
     options: &'a Options,
     root: &'a Path,
@@ -166,6 +169,7 @@ impl Engine<'_> {
             "clean build failed or timed out:\n{log}"
         );
         let artifacts = crate::host::Build::from_messages(&log).ok();
+        let build_log = log;
         let adaptive = self.options.test_workspace && self.options.timeout.is_none();
         let start = Instant::now();
         let (s, log) = self.tests(
@@ -193,15 +197,69 @@ impl Engine<'_> {
                 timeout.as_secs_f64()
             );
         }
-        Ok(Baseline { artifacts, timeout })
+        let libraries_first = self.options.workspace_coverage
+            && !self.options.lib
+            && self.matching_libraries(&build_log)
+            && self
+                .library_tests(timeout)
+                .is_ok_and(|s| s == Status::Survived);
+        Ok(Baseline {
+            artifacts,
+            timeout,
+            libraries_first,
+        })
+    }
+    fn matching_targets(&self, mut cmd: Command, full: &Harnesses) -> Result<Harnesses> {
+        cmd.args(["--no-run", "--message-format=json"]);
+        let (status, log) = crate::runner::execute(
+            cmd,
+            self.temp,
+            Duration::from_secs(self.options.build_timeout.get() as u64),
+        )?;
+        ensure!(
+            status.is_some_and(|s| s.success()),
+            "target-filtered build failed"
+        );
+        let selected = harnesses(&log)?;
+        ensure!(
+            selected.iter().all(|(p, t)| full.get(p) == Some(t)),
+            "target filters changed a test artifact"
+        );
+        Ok(selected)
+    }
+    fn matching_libraries(&self, full_messages: &str) -> bool {
+        let mut cmd = self.command();
+        cmd.arg("--lib");
+        harnesses(full_messages).is_ok_and(|full| self.matching_targets(cmd, &full).is_ok())
+    }
+    fn library_tests(&self, timeout: Duration) -> Result<Status> {
+        let mut cmd = self.command();
+        cmd.arg("--lib");
+        Self::outcome(crate::runner::execute(cmd, self.temp, timeout)?)
     }
     fn literal(&self, id: usize) -> Result<(usize, Status)> {
         self.catalog.literal(self.root, id)?;
-        let (build, msg) = self.build(false)?;
+        let (build, msg) = self.build(self.libraries_first)?;
         let status = if build.is_none() {
             Status::Timeout
         } else if build.is_some_and(|s| s.success()) {
-            self.classify(None)?
+            // Cargo's default ordering can run long integration targets before
+            // the library that detects this edit. Keep the original suite for
+            // every case that the validated library subset does not kill.
+            if self.libraries_first
+                && self.matching_libraries(&msg)
+                && self
+                    .library_tests(self.timeout)
+                    .is_ok_and(|s| s == Status::Killed)
+            {
+                eprintln!(
+                    "Workspace library tests killed {}",
+                    self.catalog.edits[id].name
+                );
+                Status::Killed
+            } else {
+                self.classify(None)?
+            }
         } else {
             ensure!(
                 (msg.contains("could not compile")
@@ -346,7 +404,7 @@ impl Engine<'_> {
         trace: &Path,
         cargo_pid: u32,
     ) -> Result<Vec<(usize, Status)>> {
-        use crate::workspace_coverage::{Scope, Target, harnesses, scopes};
+        use crate::workspace_coverage::{Scope, Target, scopes};
         let full = harnesses(messages)?;
         let groups = scopes(ids, &fs::read_to_string(trace)?, cargo_pid, &full)?;
         let mut results = Vec::new();
@@ -371,17 +429,9 @@ impl Engine<'_> {
                     for target in &selectors {
                         target.select(&mut build);
                     }
-                    build.args(["--no-run", "--message-format=json"]);
-                    let (status, log) = crate::runner::execute(
-                        build,
-                        self.temp,
-                        Duration::from_secs(self.options.build_timeout.get() as u64),
-                    )?;
-                    let same_artifacts = status.is_some_and(|s| s.success())
-                        && harnesses(&log).is_ok_and(|selected| {
-                            paths.iter().all(|p| selected.contains_key(p))
-                                && selected.iter().all(|(p, t)| full.get(p) == Some(t))
-                        });
+                    let same_artifacts = self
+                        .matching_targets(build, &full)
+                        .is_ok_and(|selected| paths.iter().all(|p| selected.contains_key(p)));
                     if !same_artifacts {
                         selectors.clear();
                     }
@@ -583,6 +633,7 @@ pub fn run(options: Options) -> Result<bool> {
         let path = crate::json_path(&manifest["manifest_path"])?;
         let package_dir = path.parent().unwrap().strip_prefix(&original)?;
         let mut engine = Engine {
+            libraries_first: false,
             timeout: options
                 .timeout
                 .map_or(DEFAULT_TIMEOUT, |s| Duration::from_secs(s.get() as u64)),
@@ -606,6 +657,7 @@ pub fn run(options: Options) -> Result<bool> {
             &package_baseline
         };
         engine.timeout = baseline.timeout;
+        engine.libraries_first = baseline.libraries_first;
         let snapshot_manifest = root.join(path.strip_prefix(&original)?);
         let host_code = baseline.artifacts.as_ref().is_none_or(|build| {
             build.needs_literal(&snapshot_manifest, || {

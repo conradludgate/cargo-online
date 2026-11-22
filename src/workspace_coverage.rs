@@ -43,7 +43,12 @@ pub fn harnesses(messages: &str) -> Result<Harnesses> {
         let target = &v["target"];
         let name = target["name"].as_str().context("missing target name")?;
         let kind = target["kind"].as_array().context("missing target kinds")?;
-        let selector = if kind.iter().any(|k| k == "lib" || k == "rlib") {
+        let selector = if kind.iter().any(|k| {
+            matches!(
+                k.as_str(),
+                Some("lib" | "rlib" | "proc-macro" | "cdylib" | "dylib" | "staticlib")
+            )
+        }) {
             Target::Library
         } else {
             match kind.first().and_then(Value::as_str) {
@@ -51,7 +56,7 @@ pub fn harnesses(messages: &str) -> Result<Harnesses> {
                 Some("bin") => Target::Binary(name.into()),
                 Some("example") => Target::Example(name.into()),
                 Some("bench") => Target::Bench(name.into()),
-                _ => continue,
+                _ => anyhow::bail!("unknown test target kind"),
             }
         };
         targets.insert(path.to_owned(), selector);

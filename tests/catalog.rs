@@ -250,6 +250,16 @@ fn workspace_coverage_keeps_downstream_kills_and_falls_back_for_doctests() {
         );
         code.push_str(&line);
     }
+    for name in ["UNIT", "INTEGRATION"] {
+        let row = code.lines().count() + 1;
+        let line = format!("pub const {name}:u32 = 1;\n");
+        let col = line.find('1').unwrap() + 1;
+        catalog.push(
+            json!({"name":name,"package":"sample","file":"src/lib.rs","replacement":"2",
+            "span":{"start":{"line":row,"column":col},"end":{"line":row,"column":col+1}}}),
+        );
+        code.push_str(&line);
+    }
     fs::write(root.join("src/lib.rs"), code).unwrap();
     fs::write(
         root.join("catalog.json"),
@@ -261,10 +271,10 @@ fn workspace_coverage_keeps_downstream_kills_and_falls_back_for_doctests() {
     fs::write(root.join("sink/Cargo.toml"), "[package]\nname='sink'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nsample={path='..'}\n").unwrap();
     fs::write(
         root.join("sink/src/lib.rs"),
-        "/// ```\n/// assert_eq!(sample::documented(), 1);\n/// ```\npub struct Example;\n",
+        "/// ```\n/// assert_eq!(sample::documented(), 1);\n/// ```\npub struct Example;\n#[test] fn library(){assert_eq!(sample::UNIT,1); }\n",
     )
     .unwrap();
-    fs::write(root.join("sink/tests/downstream.rs"), "#[test] fn check(){std::hint::black_box(sample::exercised());assert_eq!(sample::integration(),1);}").unwrap();
+    fs::write(root.join("sink/tests/downstream.rs"), "#[test] fn check(){std::hint::black_box(sample::exercised());assert_eq!(sample::integration(),1);assert_eq!(sample::INTEGRATION,1);}").unwrap();
     fs::write(root.join("tests/check.rs"), r#"#[test] fn unrelated(){
         if let Ok(id)=std::env::var("CARGO_ONLINE_MUTANT") {
             std::fs::write(std::path::PathBuf::from(std::env::var_os("WITNESS").unwrap()).join(id), "").unwrap();
@@ -287,10 +297,23 @@ fn workspace_coverage_keeps_downstream_kills_and_falls_back_for_doctests() {
         "Uncovered\tunused",
         "Killed\tdocumented",
         "Survived\texercised",
+        "Killed\tUNIT",
+        "Killed\tINTEGRATION",
         "4 in 1 shared builds",
     ] {
         assert!(stdout.contains(result), "{stdout}");
     }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l == "Workspace library tests killed UNIT"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Workspace library tests killed INTEGRATION"),
+        "{stderr}"
+    );
     assert!(
         root.join("3").exists(),
         "doctest hit requires the full suite"
