@@ -21,6 +21,26 @@ The runner supports native Linux libraries with the standard libtest harness and
 
 The command copies the workspace to a temporary session under Cargo's target directory, builds there, and keeps dependency artifacts under `target/cargo-online/build`. The workspace must be self-contained, with regular files and directories. The copy omits Git metadata, scratch directories, and build outputs. Test processes share the copied package directory and inherit the caller's environment. Use `-j 1` for tests that need exclusive access to shared resources.
 
+### Rustyguard benchmark
+
+On the Rustyguard workspace at `a8a0c62fd639da0e5103989023597539d39ce6d6`, both modes killed the same individual mutants in all three trials. Timings are medians on x86-64 Linux with rustc 1.99.1, a release build of cargo-online, warm dependency artifacts, default test profiles, four workers, and a 45-second per-test timeout. Total time includes the workspace copy, instrumented build, baseline tests, and mutant runs.
+
+| Package | Mode | Mutants | Baseline tests | Mutant test executions | Killed / survived / uncovered | Mutation time | Total time |
+|---|---|---:|---:|---:|---:|---:|---:|
+| rustyguard-core | Selected | 31 | 18 | 56 | 21 / 3 / 7 | 0.110 s | 0.874 s |
+| rustyguard-core | Full | 31 | 18 | 324 | 21 / 10 / 0 | 0.384 s | 1.195 s |
+| rustyguard-utils | Selected | 6 | 9 | 8 | 5 / 1 / 0 | 10.170 s | 10.531 s |
+| rustyguard-utils | Full | 6 | 9 | 22 | 5 / 1 / 0 | 10.235 s | 10.551 s |
+
+A separate control on `rustyguard-core` compiled each of the 31 negations individually and ran the full library unit suite with four test threads per invocation. After warming its baseline build, that single trial took 9.899 seconds and agreed on all 21 kills. The bundled run combines build reuse, test selection, and early exit, so this comparison measures their combined effect. On `rustyguard-utils`, selection reduced test executions with little effect on elapsed time.
+
+To repeat the bundled measurements from the Rustyguard workspace, run the following pair three times for each package after warming the dependency cache:
+
+```sh
+cargo online mutate -p rustyguard-core -j 4 --timeout 45
+cargo online mutate -p rustyguard-core -j 4 --timeout 45 --full
+```
+
 ## Longer-term design
 
 The long-term goal is an incremental Rust development compiler and test engine: rebuild only what changed, automatically run impacted tests, and share compiler analysis and machine code across mutation variants. The sections below describe the proposed compiler and watch architecture. The current mutation command uses source instrumentation and libtest.
