@@ -379,7 +379,11 @@ impl Engine<'_> {
                 return Ok(());
             }
             if !suspects.is_empty() {
-                literal.extend(&suspects);
+                // These edits already triggered a compiler diagnostic. Confirm
+                // them on the warm target before allocating any literal workers.
+                for &id in &suspects {
+                    report.results.push(self.literal(id)?);
+                }
                 let remaining: Vec<_> = ids
                     .iter()
                     .copied()
