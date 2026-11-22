@@ -1,5 +1,6 @@
 mod catalog;
 mod engine;
+mod host;
 mod instrument;
 mod runner;
 

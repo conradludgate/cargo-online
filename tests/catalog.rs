@@ -130,19 +130,30 @@ fn executes_catalog_with_shared_and_literal_builds() {
 }
 
 #[test]
-fn workspace_test_observes_mutation_in_a_build_dependency() {
+fn build_dependency_uses_the_scope_of_the_selected_suite() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     setup(root);
     let manifest = root.join("Cargo.toml");
     let mut content = fs::read_to_string(&manifest).unwrap();
-    content.push_str("\n[workspace]\nmembers=['consumer']\n");
+    content.push_str("\n[workspace]\nmembers=['consumer','bridge']\n");
     fs::write(manifest, content).unwrap();
+    fs::create_dir_all(root.join("bridge/src")).unwrap();
+    fs::write(root.join("bridge/Cargo.toml"),"[package]\nname='bridge'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nrenamed={package='sample',path='..'}\n").unwrap();
+    fs::write(
+        root.join("bridge/src/lib.rs"),
+        "pub fn value()->bool {renamed::weak(5)}",
+    )
+    .unwrap();
     fs::create_dir_all(root.join("consumer/src")).unwrap();
-    fs::write(root.join("consumer/Cargo.toml"), "[package]\nname='consumer'\nversion='0.1.0'\nedition='2021'\n[build-dependencies]\nsample={path='..'}\n").unwrap();
+    fs::write(root.join("consumer/Cargo.toml"), "[package]\nname='consumer'\nversion='0.1.0'\nedition='2021'\n[features]\ngenerated=['dep:bridge']\n[build-dependencies]\nbridge={path='../bridge',optional=true}\n").unwrap();
     fs::write(
         root.join("consumer/build.rs"),
-        r#"fn main(){println!("cargo:rustc-env=VALUE={}",sample::weak(5));}"#,
+        r#"fn main(){
+          #[cfg(feature="generated")] let value=bridge::value();
+          #[cfg(not(feature="generated"))] let value=true;
+          println!("cargo:rustc-env=VALUE={value}");
+        }"#,
     )
     .unwrap();
     fs::write(
@@ -159,8 +170,53 @@ fn workspace_test_observes_mutation_in_a_build_dependency() {
     )
     .unwrap();
 
+    // The integration test links a normal library artifact even in this
+    // package-only run. The consumer and its build script are inactive.
+    let out = command(root).args(["-p", "sample"]).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("1 in 1 shared builds"), "{stdout}");
+    assert!(stdout.contains("Survived\tsurvivor"), "{stdout}");
+
+    let bridge = fs::read_to_string(root.join("bridge/src/lib.rs")).unwrap();
+    let start = bridge.find('{').unwrap() + 1;
+    candidates.push(json!({"name":"bridge returns false","package":"bridge","file":"bridge/src/lib.rs",
+        "replacement":"{ false }","span":{"start":{"line":1,"column":start},"end":{"line":1,"column":bridge.len()+1}}}));
+    fs::write(
+        root.join("catalog.json"),
+        serde_json::to_vec(&candidates).unwrap(),
+    )
+    .unwrap();
+    let disabled = command(root).arg("--test-workspace").output().unwrap();
+    assert_eq!(
+        disabled.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    let stderr = String::from_utf8(disabled.stderr).unwrap();
+    assert_eq!(
+        stderr.matches("Workspace baseline passed").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("mutant suite timeout 120.0s"), "{stderr}");
+    let stdout = String::from_utf8(disabled.stdout).unwrap();
+    assert!(stdout.contains("2 in 2 shared builds"), "{stdout}");
+
     let out = command(root)
-        .args(["-p", "sample", "--test-workspace"])
+        .args([
+            "--timeout",
+            "12",
+            "--test-workspace",
+            "--features",
+            "consumer/generated",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -168,6 +224,10 @@ fn workspace_test_observes_mutation_in_a_build_dependency() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("mutant suite timeout 12.0s"), "{stderr}");
     let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("Killed\tbridge returns false"), "{stdout}");
     assert!(stdout.contains("Killed\tsurvivor"), "{stdout}");
+    assert!(stdout.contains("2 literal builds"), "{stdout}");
 }

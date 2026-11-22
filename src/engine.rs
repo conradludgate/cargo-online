@@ -27,9 +27,9 @@ pub struct Options {
     /// Maximum number of runtime variants in a build.
     #[arg(long, default_value = "32")]
     batch_size: NonZeroUsize,
-    /// Maximum seconds for a test suite invocation.
-    #[arg(long, default_value = "120")]
-    timeout: NonZeroUsize,
+    /// Maximum seconds per suite. Workspace runs default to twice the clean suite time (minimum 120s).
+    #[arg(long)]
+    timeout: Option<NonZeroUsize>,
     /// Maximum seconds for one Cargo build, including build scripts.
     #[arg(long, default_value = "300")]
     build_timeout: NonZeroUsize,
@@ -55,6 +55,19 @@ pub struct Options {
     #[arg(last = true)]
     discovery_args: Vec<std::ffi::OsString>,
 }
+impl Options {
+    fn feature_args(&self, c: &mut Command) {
+        if self.all_features {
+            c.arg("--all-features");
+        }
+        if self.no_default_features {
+            c.arg("--no-default-features");
+        }
+        for f in &self.features {
+            c.arg("--features").arg(f);
+        }
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Status {
     Killed,
@@ -63,7 +76,16 @@ enum Status {
     Unviable,
     Uncovered,
 }
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+const WORKSPACE_BASELINE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+struct Baseline {
+    artifacts: Option<crate::host::Build>,
+    timeout: Duration,
+}
+
 struct Engine<'a> {
+    timeout: Duration,
     options: &'a Options,
     root: &'a Path,
     target: PathBuf,
@@ -94,15 +116,7 @@ impl Engine<'_> {
         if self.options.lib {
             c.arg("--lib");
         }
-        if self.options.all_features {
-            c.arg("--all-features");
-        }
-        if self.options.no_default_features {
-            c.arg("--no-default-features");
-        }
-        for f in &self.options.features {
-            c.arg("--features").arg(f);
-        }
+        self.options.feature_args(&mut c);
         c
     }
     fn build(&self, json: bool) -> Result<(Option<ExitStatus>, String)> {
@@ -117,19 +131,15 @@ impl Engine<'_> {
             Duration::from_secs(self.options.build_timeout.get() as u64),
         )
     }
-    fn tests(&self, id: Option<usize>) -> Result<(Option<ExitStatus>, String)> {
+    fn tests(&self, id: Option<usize>, timeout: Duration) -> Result<(Option<ExitStatus>, String)> {
         let mut cmd = self.command();
         if let Some(i) = id {
             cmd.env("CARGO_ONLINE_MUTANT", (i + 1).to_string());
         }
-        crate::runner::execute(
-            cmd,
-            self.temp,
-            Duration::from_secs(self.options.timeout.get() as u64),
-        )
+        crate::runner::execute(cmd, self.temp, timeout)
     }
     fn classify(&self, id: Option<usize>) -> Result<Status> {
-        let (status, log) = self.tests(id)?;
+        let (status, log) = self.tests(id, self.timeout)?;
         match status {
             Some(s) if s.success() => Ok(Status::Survived),
             None => Ok(Status::Timeout),
@@ -143,18 +153,41 @@ impl Engine<'_> {
             _ => bail!("Cargo test infrastructure failed:\n{log}"),
         }
     }
-    fn baseline(&self) -> Result<()> {
-        let (status, log) = self.build(false)?;
+    fn baseline(&self) -> Result<Baseline> {
+        let (status, log) = self.build(true)?;
         ensure!(
             status.is_some_and(|s| s.success()),
             "clean build failed or timed out:\n{log}"
         );
-        let (s, log) = self.tests(None)?;
+        let artifacts = crate::host::Build::from_messages(&log).ok();
+        let adaptive = self.options.test_workspace && self.options.timeout.is_none();
+        let start = Instant::now();
+        let (s, log) = self.tests(
+            None,
+            if adaptive {
+                WORKSPACE_BASELINE_TIMEOUT
+            } else {
+                self.timeout
+            },
+        )?;
+        let elapsed = start.elapsed();
         ensure!(
             s.is_some_and(|s| s.success()),
             "baseline failed or timed out:\n{log}"
         );
-        Ok(())
+        let timeout = if adaptive {
+            DEFAULT_TIMEOUT.max(elapsed.saturating_mul(2))
+        } else {
+            self.timeout
+        };
+        if self.options.test_workspace {
+            eprintln!(
+                "Workspace baseline passed in {:.1}s, mutant suite timeout {:.1}s",
+                elapsed.as_secs_f64(),
+                timeout.as_secs_f64()
+            );
+        }
+        Ok(Baseline { artifacts, timeout })
     }
     fn literal(&self, id: usize) -> Result<(usize, Status)> {
         self.catalog.literal(self.root, id)?;
@@ -264,7 +297,7 @@ impl Engine<'_> {
             exe,
             self.root.join(self.package_dir),
             self.temp,
-            Duration::from_secs(self.options.timeout.get() as u64),
+            self.timeout,
         )?;
         let tests = harness.tests()?;
         ensure!(!tests.is_empty(), "no discoverable libtest tests");
@@ -365,53 +398,6 @@ impl Engine<'_> {
     }
 }
 
-// A build script or procedural macro can observe a variant during compilation,
-// before any test process exists. Use source edits for those packages.
-fn compile_time_packages(meta: &Value) -> Result<BTreeSet<&str>> {
-    let packages = meta["packages"]
-        .as_array()
-        .context("missing workspace packages")?;
-    let mut literal = BTreeSet::new();
-    let mut host_dependencies = Vec::new();
-    let mut deps = BTreeMap::new();
-    for package in packages {
-        let name = package["name"].as_str().context("missing package name")?;
-        let kinds = package["targets"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .flat_map(|t| t["kind"].as_array().into_iter().flatten());
-        for kind in kinds {
-            if kind == "proc-macro" {
-                host_dependencies.push(name);
-            }
-            if kind == "custom-build" {
-                literal.insert(name);
-            }
-        }
-        for dep in package["dependencies"].as_array().into_iter().flatten() {
-            let target = dep["name"].as_str().context("missing dependency name")?;
-            if dep["kind"] == "build" {
-                host_dependencies.push(target);
-            }
-            if dep["kind"].is_null() {
-                deps.entry(name).or_insert_with(Vec::new).push(target);
-            }
-        }
-    }
-    // A regular library can run inside another package's build script.
-    let mut visited = BTreeSet::new();
-    while let Some(name) = host_dependencies.pop() {
-        if visited.insert(name) {
-            literal.insert(name);
-            if let Some(children) = deps.get(name) {
-                host_dependencies.extend(children);
-            }
-        }
-    }
-    Ok(literal)
-}
-
 pub fn run(options: Options) -> Result<bool> {
     let start = Instant::now();
     let manifest = options.manifest_path.canonicalize()?;
@@ -481,7 +467,7 @@ pub fn run(options: Options) -> Result<bool> {
         bundled: 0,
         builds: 0,
     };
-    let compile_time = compile_time_packages(&meta)?;
+    let mut workspace_baseline = None;
     for (package, ids) in packages {
         let manifest = meta["packages"]
             .as_array()
@@ -491,7 +477,10 @@ pub fn run(options: Options) -> Result<bool> {
             .context("unknown mutation package")?;
         let path = crate::json_path(&manifest["manifest_path"])?;
         let package_dir = path.parent().unwrap().strip_prefix(&original)?;
-        let engine = Engine {
+        let mut engine = Engine {
+            timeout: options
+                .timeout
+                .map_or(DEFAULT_TIMEOUT, |s| Duration::from_secs(s.get() as u64)),
             options: &options,
             root: &root,
             target: cache.join("catalog-build"),
@@ -501,8 +490,29 @@ pub fn run(options: Options) -> Result<bool> {
             package,
             pool: &pool,
         };
-        engine.baseline()?;
-        let host_code = compile_time.contains(package.as_str());
+        let package_baseline;
+        let baseline = if options.test_workspace {
+            if workspace_baseline.is_none() {
+                workspace_baseline = Some(engine.baseline()?);
+            }
+            workspace_baseline.as_ref().unwrap()
+        } else {
+            package_baseline = engine.baseline()?;
+            &package_baseline
+        };
+        engine.timeout = baseline.timeout;
+        let snapshot_manifest = root.join(path.strip_prefix(&original)?);
+        let host_code = baseline.artifacts.as_ref().is_none_or(|build| {
+            build.needs_literal(&snapshot_manifest, || {
+                let mut cmd = cargo();
+                cmd.current_dir(&root).arg("metadata");
+                if !options.test_workspace {
+                    cmd.arg("--manifest-path").arg(&snapshot_manifest);
+                }
+                options.feature_args(&mut cmd);
+                cmd
+            })
+        });
         let (runtime, mut literal): (Vec<_>, Vec<_>) = ids
             .into_iter()
             .partition(|&i| catalog.bundleable(i) && !host_code);
