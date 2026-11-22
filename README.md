@@ -1,12 +1,29 @@
 # cargo-online
 
-> **Concept / design proposal — no implementation yet.**
->
-> An incremental Rust development compiler and test engine: rebuild only what changed, automatically run impacted tests, and make mutation testing substantially cheaper by sharing compiler analysis and machine code.
+Run comparison mutants against your Rust library's unit tests. `cargo online mutate` builds one instrumented test executable for the package. Each test process activates one mutant, so adding a mutant does not require another Cargo build or link.
 
-`cargo-online` is a working name. The long-term vision is an *online, workspace-aware compiler* that understands changes at a finer granularity than Cargo crates and LLVM codegen units (CGUs). Its core data — compiler dependencies, compiled artifacts, and per-test execution coverage — should serve both the edit–test loop and high-throughput mutation testing.
+## Run mutation tests
 
-The project is exploratory. Commands, component names, and implementation approaches below are **proposed**, not available today.
+From the cargo-online checkout, install with `cargo install --path . --locked`. In the target workspace, run:
+
+```sh
+cargo online mutate -p my-library -j 4
+cargo online mutate -p my-library -j 4 --full
+```
+
+The default run executes each non-ignored library unit test once to check the baseline and record the comparisons it reaches. For each mutant, it runs the covering tests fastest first and stops at the first failure or timeout. Independent mutants run in parallel. `--full` tries every runnable unit test for each mutant, with the same early exit. Use it to check whether coverage-based selection missed a kill, particularly for nondeterministic tests.
+
+The report gives each comparison's source location, outcome, and the test that killed it or timed out. **Uncovered** means no baseline test reached the comparison. **Survived** means all selected tests passed. The default per-process timeout is 60 seconds and can be set with `--timeout SECONDS`. The command exits with 0 when all mutants are killed, 1 when mutants survive, lack coverage, or time out, and 2 for a build, baseline, or runner error.
+
+### Supported targets
+
+The runner supports native Linux libraries with the standard libtest harness and default Cargo features. It negates the boolean result of equality and ordering comparisons in runtime function bodies, preserving operand evaluation. It follows conventional library modules and skips explicit test functions and `#[cfg(test)]` modules, const functions, macro expansions, and `#[path]` modules. Other conditional compilation can leave inactive sites in the report. Integration tests, doctests, and downstream crates are outside this version's test scope.
+
+The command copies the workspace to a temporary session under Cargo's target directory, builds there, and keeps dependency artifacts under `target/cargo-online/build`. The workspace must be self-contained, with regular files and directories. The copy omits Git metadata, scratch directories, and build outputs. Test processes share the copied package directory and inherit the caller's environment. Use `-j 1` for tests that need exclusive access to shared resources.
+
+## Longer-term design
+
+The long-term goal is an incremental Rust development compiler and test engine: rebuild only what changed, automatically run impacted tests, and share compiler analysis and machine code across mutation variants. The sections below describe the proposed compiler and watch architecture. The current mutation command uses source instrumentation and libtest.
 
 ## The developer experience
 
@@ -31,7 +48,7 @@ For exhaustive validation, explicitly ask for the full suite; the selective mode
 
 ```sh
 cargo online test --all           # proposed
-cargo online mutate               # proposed: throughput-oriented mutation analysis
+cargo online mutate               # implemented for library unit tests
 cargo online mutate --changed     # proposed: mutation analysis of changed code
 ```
 
@@ -255,4 +272,4 @@ A worthwhile early prototype is *just* automatic selected-test execution with an
 
 ---
 
-**Status:** design exploration. No tool named `cargo online` is implemented or published by this repository yet. Contributions, implementation experiments and benchmark results are welcome.
+**Status:** Source-level bundled mutation testing is available. Watch mode, MIR mutation, and the fine-grained compiler cache remain design proposals.
