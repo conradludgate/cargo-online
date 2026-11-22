@@ -50,6 +50,25 @@ Comparison-only mode supports native Linux libraries with the standard libtest h
 
 The command copies the workspace to a temporary session under Cargo's target directory, builds there, and keeps dependency artifacts under `target/cargo-online/build`. The workspace must be self-contained. Symlinks must resolve inside the workspace. The copy omits Git metadata, scratch directories, and build outputs. Test processes share the copied package directory and inherit the caller's environment. Use `-j 1` for tests that need exclusive access to shared resources.
 
+### Rama workspace benchmark
+
+At Rama revision `a8e7406af9d9483fb06506895b6639eb31107c8f`, workspace discovery matched all 67,884 cargo-mutants candidates across 55 packages. For an execution benchmark, we selected 115 candidates from four libraries and ran each against its owning library's unit tests.
+
+| Runner | End-to-end seconds with a fresh target | Shared compilation |
+|---|---:|---|
+| cargo-online `eef2d17` | 276.184 | 0 candidates |
+| cargo-online `8624d27` | 169.565, 169.945 | 69 candidates in 5 builds |
+| cargo-mutants 27.1.0 | 186.092 | Individual edits |
+
+Every run agreed by name on the 46 killed and 39 unviable mutants. Of the 30 that cargo-mutants missed, cargo-online reported six survivors and 24 uncovered by the selected unit tests. Runs used rustc 1.99.1 on x86-64 Linux, default features, four Cargo build jobs, and disabled debug info in the test and dev profiles. Dependencies were already downloaded. Reproduce the selection from the Rama workspace root:
+
+```sh
+cargo online mutate --lib -j3 --timeout 45 --build-timeout 600 -- \
+  --file 'rama-core/src/**' --file 'rama-error/src/**' \
+  --file 'rama-http-types/src/**' --file 'rama-utils/src/**' \
+  --sharding round-robin --shard 0/64
+```
+
 ### Rustyguard benchmark
 
 #### Full cargo-mutants catalog
