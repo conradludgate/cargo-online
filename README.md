@@ -361,4 +361,4 @@ A worthwhile early prototype is *just* automatic selected-test execution with an
 
 ---
 
-**Status:** Source-level bundled mutation testing is available. Watch mode, MIR mutation, and the fine-grained compiler cache remain design proposals.
+**Status:** The CLI uses source-level bundled mutation testing. A [standalone rustc driver experiment](experiments/mir-equality.rs) rewrites a single primitive equality in optimized MIR at a cargo-mutants source position. It requires a matching nightly compiler and rustc-dev libraries. Watch mode, multi-mutant MIR builds, and the fine-grained compiler cache remain design proposals.
