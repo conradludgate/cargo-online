@@ -103,6 +103,10 @@ cargo online mutate --test-workspace -j1 --build-timeout 1200 -- --sharding roun
 cargo online mutate --test-workspace --workspace-coverage -j1 --build-timeout 1200 -- --sharding round-robin --shard 0/16384
 ```
 
+With the pinned MIR driver, a separate run used all workspace library tests and selected two edits individually. The suite killed the comparison in `rama-fastcgi::decode_length_from_slice` in one native MIR build (269.241 s). It also killed the depth-limit comparison in `rama-error` through an independent build (150.920 s). Some workspace build scripts depend on `rama-error`, so an edit there must also take effect while Cargo builds the workspace. These are two end-to-end samples from the 67,884 candidates.
+
+On this revision, the pinned nightly enables six obsolete nightly-only benches in the `rama-http-headers` test harness. For both runs a compiler wrapper removed that crate's `--cfg nightly` only when compiling its test harness. Tests had access to local sockets. A repeat using nightly Cargo also stopped at the unmodified baseline because two gRPC example tests read `OUT_DIR` at runtime and that invocation omitted it.
+
 ### Rustyguard benchmark
 
 #### Full cargo-mutants catalog
@@ -120,6 +124,19 @@ One cold-target trial on `rustyguard-core` took **45.122 s** with cargo-online a
 cargo online mutate -p rustyguard-core -j 3 --timeout 15
 cargo mutants -p rustyguard-core -j 3 --timeout 15
 ```
+
+#### Throughput with the pinned MIR driver
+
+On the same 249 `rustyguard-core` edits, both modes agreed by name and classification with cargo-mutants 27.1.0. Runs used the owning package's normal Cargo suite, the same pinned rustc, three mutation workers, six Cargo jobs, a 15-second timeout and warm dependency builds.
+
+| Engine | Without learned routes (s) | Repeat 1 (s) | Repeat 2 (s) |
+|---|---:|---:|---:|
+| Source bundles | 47.236 | 32.631 | 33.252 |
+| MIR and source bundles | 56.383 | 34.006 | 33.530 |
+
+The source run without learned routes was measured separately. The two repeat pairs alternated on an otherwise idle benchmark host. On repeat runs both engines shared 129 edits across five builds and compiled 120 individually. The driver handled 24 edits directly in MIR. Previously learned build choices reduced work on repeat runs. All runs executed the tests again. These timings do not establish a throughput advantage for the MIR driver over source bundles. Cargo-mutants reported 45 s in its independent run.
+
+To reproduce, run `cargo online mutate -p rustyguard-core -j3 --timeout 15` with `RUSTC` and `RUSTDOC` pointing to the pinned toolchain and debug info disabled in the dev and test profiles. Add `--mir-rustc "$RUSTC"` for the MIR run.
 
 #### Comparison-only benchmark
 
@@ -160,6 +177,18 @@ The driver instruments the selected library test harnesses, fingerprints functio
 Add `--instance-codegen` to a development run to try finer-grained object reuse. The driver consults rustc's monomorphised item graph and splits eligible local functions into individually named codegen units. Items with explicit linkage, local inline copies, and functions that need a private symbol in their original unit keep their original placement. Rustc tracks dependencies, reuses valid object files and relinks the test executable. This experimental mode uses a separate incremental target. More objects can increase codegen and link time.
 
 The integration test changes one of two functions, checks that the edited object's inode changed and that rustc reused the other object's inode, and observes the intended failing test. On Rama revision `a8e7406af`, the driver isolated 15 instances in 59 codegen units for `rama-error`. All 45 library tests passed.
+
+### Edit-to-first-failure benchmark
+
+Run `experiments/edit-latency.sh "$MIR_RUSTC" /path/to/rama` after a release build. The script extracts the pinned `rama-error` sources, warms each mode on a passing revision, inverts the depth-limit comparison, and checks that the expected truncation test fails. It uses one test thread. The full library has 45 tests and the priority set has 28. These elapsed seconds include compilation, linking and execution up to the first failure.
+
+| Mode | Trial 1 | Trial 2 | Trial 3 |
+|---|---:|---:|---:|
+| Full library | 0.336 | 0.358 | 0.386 |
+| Prioritised library tests | 0.345 | 0.388 | 0.380 |
+| Prioritised, per-function codegen | 0.270 | 0.310 | 0.330 |
+
+Without the Rama path the script uses a two-test fixture with a 300 ms unrelated test. Full validation reported the failure in 0.451, 0.462 and 0.478 s. Prioritisation reported it in 0.166, 0.169 and 0.153 s. On the real library, prioritisation alone had a slightly higher median than full validation. The per-function result is specific to this crate, edit and host.
 
 ## Longer-term design
 
