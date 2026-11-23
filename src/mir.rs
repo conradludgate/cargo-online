@@ -84,6 +84,7 @@ impl Toolchain {
                         .arg(p.join(out)),
                 )?;
             }
+            fs::hard_link(p.join("cargo-online-rustc"), p.join("cargo-online-rustdoc"))?;
             if let Err(e) = fs::rename(p, &directory)
                 && !directory.is_dir()
             {
@@ -106,7 +107,8 @@ impl Toolchain {
     pub fn instrument(&self, cmd: &mut Command, wrapper: &Path, package: &Path, report: &Path) {
         self.compiler(cmd);
         cmd.env("CARGO_ONLINE_SYSROOT", &self.sysroot);
-        cmd.env("RUSTC_WORKSPACE_WRAPPER", wrapper)
+        cmd.env("RUSTDOC", self.directory.join("cargo-online-rustdoc"))
+            .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
             .env(
                 "CARGO_ONLINE_MIR_RUNTIME",
                 self.directory.join(&self.runtime),

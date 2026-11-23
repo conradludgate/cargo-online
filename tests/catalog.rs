@@ -469,6 +469,50 @@ fn workspace_mir_preserves_downstream_and_shared_source_kills() {
 }
 
 #[test]
+#[ignore = "requires CARGO_ONLINE_TEST_CARGO and CARGO_ONLINE_TEST_RUSTC"]
+fn a_doctest_can_kill_a_native_mutant() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    setup(root);
+    let line = "pub fn selected(x: u8) -> bool { x == 3 }";
+    let source = format!("//! ```\n//! assert!(sample::selected(3));\n//! ```\n{line}\n");
+    fs::write(root.join("src/lib.rs"), source).unwrap();
+    fs::write(root.join("tests/check.rs"), "").unwrap();
+    let start = line.find("==").unwrap() + 1;
+    let catalog = json!([{
+        "name": "doctest-only comparison", "package": "sample", "file": "src/lib.rs",
+        "replacement": "!=", "span": {
+            "start": {"line":4, "column":start}, "end": {"line":4, "column":start + 2}
+        }
+    }]);
+    fs::write(
+        root.join("catalog.json"),
+        serde_json::to_vec(&catalog).unwrap(),
+    )
+    .unwrap();
+    let out = command(root)
+        .env(
+            "CARGO",
+            std::env::var_os("CARGO_ONLINE_TEST_CARGO").unwrap(),
+        )
+        .args(["--test-workspace", "--full", "--mir-rustc"])
+        .arg(std::env::var_os("CARGO_ONLINE_TEST_RUSTC").unwrap())
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(out.status.success(), "{log}");
+    assert!(
+        log.contains("1 native MIR edits and 0 source edits"),
+        "{log}"
+    );
+    assert!(log.contains("Killed\tdoctest-only comparison"), "{log}");
+}
+
+#[test]
 fn a_cached_build_route_never_reuses_an_unviable_verdict() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

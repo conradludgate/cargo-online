@@ -452,6 +452,23 @@ impl rustc_driver::Callbacks for Callbacks {
     }
 }
 fn main() -> ExitCode {
+    if env::args_os()
+        .next()
+        .as_deref()
+        .and_then(|p| Path::new(p).file_name())
+        == Some(std::ffi::OsStr::new("cargo-online-rustdoc"))
+    {
+        let sysroot = PathBuf::from(env::var_os("CARGO_ONLINE_SYSROOT").unwrap());
+        let runtime = PathBuf::from(env::var_os("CARGO_ONLINE_MIR_RUNTIME").unwrap());
+        let mut search = std::ffi::OsString::from("dependency=");
+        search.push(runtime.parent().unwrap());
+        let error = Command::new(sysroot.join("bin/rustdoc"))
+            .args(env::args_os().skip(1))
+            .arg("-L")
+            .arg(search)
+            .exec();
+        panic!("{error}");
+    }
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     let dev = env::var_os("CARGO_ONLINE_MIR_DEV").is_some();
     let owner = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from)
