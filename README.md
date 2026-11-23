@@ -127,6 +127,8 @@ On nightly Cargo, two consecutive one-mutant batches targeted the equality compa
 
 At revision `93cdf0e`, the first comparison in the async reader used shared source dispatch. The second comparison in the slice decoder ran natively in MIR, passed its inactive workspace control including doctests, and was killed by the FastCGI tests. The complete two-mutant run took 1,155.72 s, including initial build and baseline. The build times compare successive plans within this run.
 
+A repeat at `cbe3cec` ran both the async and synchronous comparisons natively. Both inactive workspace controls passed and both mutants were killed. The first instrumented build took 642.55 s and rebuilt 220 workspace artifacts. The next took 2.40 s, rebuilding the two FastCGI artifacts and reusing the other 218. The clean test suite took 91.2 s and the entire run took 1,667.81 s, including a 747.24 s initial build. Three other workspace benchmark workers overlapped this run. These timings show artifact reuse within a session.
+
 #### Effect of loopback latency on the workspace run
 
 Rama's HTTP/2 integration test `h2::hammer::hammer_client_concurrency` creates 5,000 loopback connections. Using the same unmodified executable, two Tokio workers, and private Linux network namespaces, it passed in 168.66, 185.70 and 172.79 s with the default loopback route. With immediate TCP acknowledgements it passed in 2.45, 0.92 and 0.88 s. The workers used `ip route replace local 127.0.0.1/32 dev lo table local scope host src 127.0.0.1 quickack 1` inside the namespace after bringing up `lo`.
