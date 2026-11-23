@@ -44,7 +44,7 @@ On native x86-64 Linux, pass the path to rustc from a toolchain with matching `r
 cargo online mutate --mir-rustc "$MIR_RUSTC" --test-workspace --workspace-coverage
 ```
 
-The compiler matches primitive comparisons, bitwise operators and scalar function-body replacements by source span and operand or return type. One executable can contain both MIR and source variants. The native selector runs inside the function, including calls through function pointers. The driver checks the mapping in each compilation that loads the file. The rustdoc wrapper supplies the selector runtime to doctest compilation. Ambiguous sites go through source dispatch or a literal build. A separately compiled workspace copy of the same native site requires a literal edit.
+The compiler matches primitive comparisons, bitwise operators and scalar function-body replacements by source span and operand or return type. One executable can contain both MIR and source variants. The native selector runs inside the function, including calls through function pointers. Primitive operator edits can also run in the generated poll body of an async function, including after an await. The driver checks the mapping in each compilation that loads the file. The rustdoc wrapper supplies the selector runtime to doctest compilation. Ambiguous sites go through source dispatch or a literal build. A separately compiled workspace copy of the same native site requires a literal edit.
 
 When the invoking Cargo supports the version-1 unit graph, the runner checks its package, target and feature sets against the clean compilation artifacts. It follows individual build-script and proc-macro dependencies in that graph. This lets a runtime feature of a library use a shared build even when a different build-time instance of its parent disables that feature. With stable Cargo the runner uses its conservative package-graph check. Set `CARGO` to a nightly Cargo executable to use unit graphs.
 
@@ -120,6 +120,12 @@ The outcomes matched the earlier unfiltered run by name. The fuzz-input edit sur
 A disjoint four-candidate shard (`8192/16384`, round-robin) took 1,120.460 s. It found two kills and two unviable edits, all from individual builds. A downstream gRPC example caught the `rama-http-types::decode_int` HPACK comparison. Together, these two shards establish nine outcomes from the 67,884-member catalog.
 
 The benchmark copy enabled the nightly test crate and provided the six header benches with the current `TypedHeader` trait under their expected name. It also used the pinned nightly's diagnostic text for the existing `case-warning.rs` compile-fail test. All six benches and the diagnostic test passed. The original and configured workspace produced byte-identical lists of all 67,884 candidates.
+
+#### Reusing workspace artifacts between MIR plans
+
+On nightly Cargo, two consecutive one-mutant batches targeted the equality comparisons in `rama-fastcgi/src/proto/params.rs`. The clean, default-feature workspace suite passed in 65.1 s. The first instrumented build took 569.40 s and rebuilt both FastCGI artifacts and 218 other workspace artifacts. The next instrumented build took 3.86 s, rebuilt both FastCGI artifacts and reused all 218 others. Cargo JSON artifact counts exclude dependencies outside the workspace snapshot.
+
+At revision `93cdf0e`, the first comparison in the async reader used shared source dispatch. The second comparison in the slice decoder ran natively in MIR, passed its inactive workspace control including doctests, and was killed by the FastCGI tests. The complete two-mutant run took 1,155.72 s, including initial build and baseline. The build times compare successive plans within this run.
 
 #### Effect of loopback latency on the workspace run
 

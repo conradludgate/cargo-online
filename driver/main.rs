@@ -126,7 +126,14 @@ fn call<'tcx>(
 fn runtime_body(tcx: TyCtxt<'_>, def: LocalDefId, closures: bool) -> bool {
     let mut owner = def.to_def_id();
     while closures && tcx.def_kind(owner) == DefKind::Closure {
-        if tcx.is_const_fn(owner) || tcx.is_coroutine(owner) {
+        if tcx.is_const_fn(owner)
+            || tcx.coroutine_kind(owner).is_some_and(|kind| {
+                !matches!(
+                    kind,
+                    rustc_hir::CoroutineKind::Desugared(rustc_hir::CoroutineDesugaring::Async, _)
+                )
+            })
+        {
             return false;
         }
         owner = tcx.parent(owner);

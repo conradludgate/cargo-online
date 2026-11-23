@@ -705,3 +705,51 @@ exec "$@"
     assert!((1..3).contains(&compiled("foreign").len()), "{plans}");
     assert_eq!(compiled("unrelated").len(), 1, "{plans}");
 }
+
+#[test]
+#[ignore = "requires CARGO_ONLINE_TEST_RUSTC with matching rustc-dev libraries"]
+fn native_comparison_after_async_suspension() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    setup(root);
+    let source = r#"pub async fn compare(value: u32) -> bool {
+    let mut first = true;
+    std::future::poll_fn(|_| {
+        if std::mem::take(&mut first) { std::task::Poll::Pending } else { std::task::Poll::Ready(()) }
+    }).await;
+    value == 7
+}
+#[test]
+fn poll_twice() {
+    use std::{future::Future, task::{Context, Poll, Waker}};
+    let mut future = std::pin::pin!(compare(7));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert_eq!(future.as_mut().poll(&mut cx), Poll::Pending);
+    assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(true));
+}
+"#;
+    fs::write(root.join("src/lib.rs"), source).unwrap();
+    let catalog = json!([{"name":"async equality","package":"sample","file":"src/lib.rs","replacement":"!=",
+        "span":{"start":{"line":6,"column":11},"end":{"line":6,"column":13}}}]);
+    fs::write(
+        root.join("catalog.json"),
+        serde_json::to_vec(&catalog).unwrap(),
+    )
+    .unwrap();
+    let out = command(root)
+        .args(["--lib", "--mir-rustc"])
+        .arg(std::env::var_os("CARGO_ONLINE_TEST_RUSTC").unwrap())
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(out.status.success(), "{log}");
+    assert!(
+        log.contains("1 native MIR edits and 0 source edits"),
+        "{log}"
+    );
+    assert!(log.contains("Killed\tasync equality"), "{log}");
+}
