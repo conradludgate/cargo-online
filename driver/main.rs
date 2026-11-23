@@ -20,7 +20,7 @@ use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::dummy_spanned;
 use std::collections::HashMap;
-use std::os::unix::process::CommandExt;
+use std::os::unix::{ffi::OsStrExt, process::CommandExt};
 use std::{
     env, fs,
     hash::{DefaultHasher, Hash, Hasher},
@@ -411,6 +411,18 @@ impl rustc_driver::Callbacks for Callbacks {
                         .ok()
                 })
                 .collect();
+            if !self.instrument {
+                // Cargo may reuse this foreign unit for many subsequent plans.
+                // Record every candidate source it loaded, including sites
+                // that only appear in a later batch.
+                let index = PathBuf::from(env::var_os("CARGO_ONLINE_MIR_SOURCE_INDEX").unwrap());
+                let flags = index.parent().unwrap().join("foreign");
+                for (n, bytes) in fs::read(index).unwrap().split(|&b| b == 0).enumerate() {
+                    if files.contains(Path::new(std::ffi::OsStr::from_bytes(bytes))) {
+                        fs::write(flags.join(n.to_string()), []).unwrap();
+                    }
+                }
+            }
             if self.instrument {
                 for def in tcx.hir_body_owners() {
                     if !runtime_body(tcx, def, true) {
@@ -438,6 +450,16 @@ impl rustc_driver::Callbacks for Callbacks {
     fn config(&mut self, c: &mut rustc_interface::Config) {
         if !self.instrument {
             return;
+        }
+        if !PLAN.get().unwrap().dev {
+            c.track_state = Some(Box::new(|sess| {
+                let name = "CARGO_ONLINE_MIR_PLAN";
+                let plan = env::var(name).unwrap();
+                sess.env_depinfo.borrow_mut().insert((
+                    rustc_span::Symbol::intern(name),
+                    Some(rustc_span::Symbol::intern(&plan)),
+                ));
+            }));
         }
         c.override_queries = Some(|_, p| {
             ORIGINAL.set(p.queries.optimized_mir).unwrap();
@@ -572,7 +594,7 @@ fn main() -> ExitCode {
             },
         )
     });
-    if status == ExitCode::SUCCESS {
+    if status == ExitCode::SUCCESS && (dev || selected) {
         let out = env::var_os("CARGO_ONLINE_MIR_REPORT").unwrap();
         let mut out = PathBuf::from(out);
         let name = args.windows(2).find(|v| v[0] == "--crate-name").unwrap()[1].as_str();
@@ -580,13 +602,7 @@ fn main() -> ExitCode {
             .iter()
             .find_map(|a| a.strip_prefix("extra-filename="))
             .unwrap_or("");
-        let prefix = if dev {
-            "bodies"
-        } else if selected {
-            "unit"
-        } else {
-            "foreign"
-        };
+        let prefix = if dev { "bodies" } else { "unit" };
         out.set_file_name(format!("{prefix}-{name}{extra}"));
         fs::write(out, REPORT.lock().unwrap().join("\n")).unwrap();
     }

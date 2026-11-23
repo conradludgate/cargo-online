@@ -48,6 +48,8 @@ The compiler matches primitive comparisons, bitwise operators and scalar functio
 
 When the invoking Cargo supports the version-1 unit graph, the runner checks its package, target and feature sets against the clean compilation artifacts. It follows individual build-script and proc-macro dependencies in that graph. This lets a runtime feature of a library use a shared build even when a different build-time instance of its parent disables that feature. With stable Cargo the runner uses its conservative package-graph check. Set `CARGO` to a nightly Cargo executable to use unit graphs.
 
+All MIR batches for one package in a session share a Cargo wrapper path. The driver records the active plan as an environment dependency of the package's compiled targets. Cargo rebuilds those targets when the plan changes and can reuse unrelated workspace units. Other units record which candidate files they loaded, so a cached cross-package `#[path]` import still forces an independent edit. The runner checks Cargo's artifact reports before accepting native mappings.
+
 Both engines remember which candidates previously needed independent compilation. On a repeat they can send those edits straight to parallel literal workers. The cache holds build choices. Every candidate still receives a fresh classification.
 
 ### Comparison-only mode

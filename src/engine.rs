@@ -99,6 +99,7 @@ struct Baseline {
 struct Engine<'a> {
     compiler: Option<&'a crate::mir::Toolchain>,
     plan: Option<&'a Path>,
+    package_driver: Option<&'a crate::mir::PackageDriver>,
     libraries_first: bool,
     timeout: Duration,
     options: &'a Options,
@@ -137,14 +138,18 @@ impl Engine<'_> {
         let mut c = cargo();
         if let Some(tc) = self.compiler {
             tc.compiler(&mut c);
-            if let Some(plan) = self.plan {
+            if let (Some(plan), Some(driver)) = (self.plan, self.package_driver) {
                 tc.instrument(
                     &mut c,
-                    &plan.join("rustc"),
+                    &driver.path().join("rustc"),
                     &self.root.join(self.package_dir),
                     &plan.join("report"),
                 );
                 c.env("CARGO_ONLINE_MIR_PLAN", plan.join("sites"))
+                    .env(
+                        "CARGO_ONLINE_MIR_SOURCE_INDEX",
+                        driver.path().join("sources"),
+                    )
                     .env("CARGO_INCREMENTAL", "0");
             }
         }
@@ -503,7 +508,7 @@ impl Engine<'_> {
         Ok(results)
     }
     fn mir_batch(&self, ids: &[usize], report: &mut Report) -> Result<Vec<usize>> {
-        let Some(tc) = self.compiler else {
+        let Some(driver) = self.package_driver else {
             return Ok(ids.to_vec());
         };
         let (mut native, source): (Vec<_>, Vec<_>) = ids.iter().copied().partition(|&id| {
@@ -521,13 +526,12 @@ impl Engine<'_> {
             .iter()
             .filter_map(|&id| self.catalog.mir_site(self.root, id, &insertions))
             .collect();
-        let dir = tempfile::tempdir_in(self.temp)?;
-        // Cargo fingerprints the workspace wrapper path. Give every immutable
-        // plan its own path, including cases where an invocation is retried.
-        fs::hard_link(tc.wrapper(), dir.path().join("rustc"))?;
-        fs::write(dir.path().join("sites"), sites.join("\n"))?;
+        // Keep plan names unique until the package finishes. Rustc emits the
+        // name as a tracked environment dependency of each instrumented unit.
+        let dir = tempfile::tempdir_in(driver.path())?.keep();
+        fs::write(dir.join("sites"), sites.join("\n"))?;
         let engine = Engine {
-            plan: Some(dir.path()),
+            plan: Some(&dir),
             target: self.target.clone(),
             ..*self
         };
@@ -556,18 +560,8 @@ impl Engine<'_> {
         let attempted = native.clone();
         let mut matched = BTreeSet::new();
         let mut foreign = BTreeSet::new();
-        for entry in fs::read_dir(dir.path())? {
+        for entry in fs::read_dir(&dir)? {
             let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with("foreign-") {
-                for line in fs::read_to_string(entry.path())?.lines() {
-                    let id: usize = line
-                        .strip_prefix("file ")
-                        .context("invalid foreign source report")?
-                        .parse()?;
-                    foreign.insert(id - 1);
-                }
-                continue;
-            }
             if !entry.file_name().to_string_lossy().starts_with("unit-") {
                 continue;
             }
@@ -584,6 +578,11 @@ impl Engine<'_> {
             native.retain(|id| !loaded.contains(&(id + 1)) || counts.get(&(id + 1)) == Some(&1));
             matched.extend(counts.into_keys());
         }
+        for &id in &attempted {
+            if driver.used_by_another_unit(&self.root.join(&self.catalog.edits[id].file))? {
+                foreign.insert(id);
+            }
+        }
         native.retain(|id| matched.contains(&(id + 1)) && !foreign.contains(id));
         if std::env::var_os("CARGO_ONLINE_VERBOSE").is_some() {
             eprintln!("MIR catalog indices: {native:?}");
@@ -594,6 +593,7 @@ impl Engine<'_> {
             .extend(attempted.into_iter().filter(|id| !native.contains(id)));
         let ready: BTreeSet<_> = native.iter().chain(&source).copied().collect();
         let usable = !ready.is_empty()
+            && crate::mir::rebuilt_owner(&log, &self.root.join(self.package_dir))?
             && engine.run_bundle(&ready.iter().copied().collect::<Vec<_>>(), &log, report)?;
         self.catalog.restore(self.root, &source)?;
         // Another workspace target can compile the same source via #[path] or include!.
@@ -828,6 +828,7 @@ pub fn run(options: Options) -> Result<bool> {
         let mut engine = Engine {
             compiler: compiler.as_ref(),
             plan: None,
+            package_driver: None,
             libraries_first: false,
             timeout: options
                 .timeout
@@ -872,6 +873,18 @@ pub fn run(options: Options) -> Result<bool> {
         let (runtime, mut literal): (Vec<_>, Vec<_>) = ids.into_iter().partition(|&i| {
             catalog.bundleable(i) && !host_code && !report.routes.literal.contains(&i)
         });
+        let package_driver = if let Some(tc) = &compiler
+            && !runtime.is_empty()
+        {
+            let paths = runtime
+                .iter()
+                .map(|&id| root.join(&catalog.edits[id].file))
+                .collect();
+            Some(crate::mir::PackageDriver::new(tc, temp.path(), paths)?)
+        } else {
+            None
+        };
+        engine.package_driver = package_driver.as_ref();
         eprintln!(
             "{}: {} catalog candidates",
             package,

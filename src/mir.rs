@@ -1,6 +1,7 @@
 //! Build the private driver and its runtime as one compiler-specific installation.
 use anyhow::{Result, ensure};
 use std::{
+    collections::BTreeSet,
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
@@ -14,6 +15,71 @@ pub struct Toolchain {
     runtime: String,
     libraries: std::ffi::OsString,
 }
+/// The wrapper identity and source index stay fixed for one package in one session.
+pub struct PackageDriver {
+    directory: tempfile::TempDir,
+    files: Vec<PathBuf>,
+}
+
+impl PackageDriver {
+    pub fn new(compiler: &Toolchain, temp: &Path, paths: BTreeSet<PathBuf>) -> Result<Self> {
+        let directory = tempfile::tempdir_in(temp)?;
+        fs::hard_link(compiler.wrapper(), directory.path().join("rustc"))?;
+        let files: BTreeSet<_> = paths
+            .into_iter()
+            .map(fs::canonicalize)
+            .collect::<std::io::Result<_>>()?;
+        let files: Vec<_> = files.into_iter().collect();
+        let mut index = Vec::new();
+        for path in &files {
+            index.extend_from_slice(path.as_os_str().as_encoded_bytes());
+            index.push(0);
+        }
+        fs::write(directory.path().join("sources"), index)?;
+        fs::create_dir(directory.path().join("foreign"))?;
+        Ok(Self { directory, files })
+    }
+
+    pub fn path(&self) -> &Path {
+        self.directory.path()
+    }
+
+    pub fn used_by_another_unit(&self, path: &Path) -> Result<bool> {
+        let path = path.canonicalize()?;
+        let index = self
+            .files
+            .binary_search(&path)
+            .map_err(|_| anyhow::anyhow!("unindexed MIR source {}", path.display()))?;
+        Ok(self
+            .path()
+            .join("foreign")
+            .join(index.to_string())
+            .try_exists()?)
+    }
+}
+
+/// Every owned artifact must describe this plan, including feature-specific
+/// builds of the same source. A Cargo cache hit has no new mapping report.
+pub fn rebuilt_owner(log: &str, owner: &Path) -> Result<bool> {
+    let mut rebuilt = false;
+    for line in log.lines().filter(|line| line.starts_with('{')) {
+        let message: serde_json::Value = serde_json::from_str(line)?;
+        if message["reason"] != "compiler-artifact"
+            || message["manifest_path"]
+                .as_str()
+                .and_then(|p| Path::new(p).parent())
+                != Some(owner)
+        {
+            continue;
+        }
+        if message["fresh"].as_bool() != Some(false) {
+            return Ok(false);
+        }
+        rebuilt = true;
+    }
+    Ok(rebuilt)
+}
+
 fn stdout(cmd: &mut Command) -> Result<String> {
     let out = cmd.output()?;
     ensure!(

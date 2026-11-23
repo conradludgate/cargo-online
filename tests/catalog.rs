@@ -613,3 +613,95 @@ exec "$CARGO_ONLINE_GRAPH_TEST_CARGO" "$@"
     let fallback = run(shim.as_os_str());
     assert!(fallback.contains("1 literal builds"), "{fallback}");
 }
+
+#[test]
+#[ignore = "requires CARGO_ONLINE_TEST_RUSTC with matching rustc-dev libraries"]
+fn successive_mir_batches_reuse_unrelated_units_and_remember_foreign_sources() {
+    let root_dir = tempfile::tempdir().unwrap();
+    let root = root_dir.path();
+    setup(root);
+    fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=['foreign','unrelated']\n[package]\nname='sample'\nversion='0.1.0'\nedition='2024'").unwrap();
+    fs::write(root.join("tests/check.rs"), "").unwrap();
+    let line = "pub fn f(x:u8)->bool { x == 3 }";
+    fs::write(
+        root.join("src/lib.rs"),
+        format!("pub mod shared;\n{line}\n#[test] fn check() {{ assert!(f(3)); }}"),
+    )
+    .unwrap();
+    fs::write(root.join("src/shared.rs"), line).unwrap();
+    fs::create_dir_all(root.join("foreign/src")).unwrap();
+    fs::write(
+        root.join("foreign/Cargo.toml"),
+        "[package]\nname='foreign'\nversion='0.1.0'\nedition='2024'",
+    )
+    .unwrap();
+    fs::write(root.join("foreign/src/lib.rs"), "#[path=\"../../src/shared.rs\"] mod shared;\n#[test] fn check() { assert!(shared::f(3)); }").unwrap();
+    fs::create_dir_all(root.join("unrelated/src")).unwrap();
+    fs::write(
+        root.join("unrelated/Cargo.toml"),
+        "[package]\nname='unrelated'\nversion='0.1.0'\nedition='2024'",
+    )
+    .unwrap();
+    fs::write(root.join("unrelated/src/lib.rs"), "#[test] fn passes() {}").unwrap();
+    let column = line.find("==").unwrap() + 1;
+    let catalog: Vec<_> = [("first", "src/lib.rs", 2, "!="), ("foreign", "src/shared.rs", 1, "!="), ("last","src/lib.rs",2,"<")]
+        .map(|(name,file,row,replacement)| json!({"name":name,"package":"sample","file":file,"replacement":replacement,"span":{"start":{"line":row,"column":column},"end":{"line":row,"column":column+2}}})).into();
+    fs::write(
+        root.join("catalog.json"),
+        serde_json::to_vec(&catalog).unwrap(),
+    )
+    .unwrap();
+    let shim = root.join("rustc-wrapper");
+    fs::write(
+        &shim,
+        r#"#!/bin/sh
+if [ -n "$CARGO_ONLINE_MIR_PLAN" ]; then
+    prev=''
+    for arg in "$@"; do
+        if [ "$prev" = --crate-name ]; then
+            echo "$arg $CARGO_ONLINE_MIR_PLAN" >> "$COMPILED_PLANS"
+        fi
+        prev=$arg
+    done
+fi
+exec "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let witness = root.join("compiled-plans");
+    let output = command(root)
+        .args(["--test-workspace", "--batch-size", "1", "--mir-rustc"])
+        .arg(std::env::var_os("CARGO_ONLINE_TEST_RUSTC").unwrap())
+        .env("RUSTC_WRAPPER", shim)
+        .env("COMPILED_PLANS", &witness)
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.status.success(), "{log}");
+    assert_eq!(log.matches("1 native MIR edits").count(), 2, "{log}");
+    assert!(
+        log.contains("2 in 2 shared builds, 1 literal builds"),
+        "{log}"
+    );
+    for name in ["first", "foreign", "last"] {
+        assert!(log.contains(&format!("Killed\t{name}")), "{log}");
+    }
+    let plans = fs::read_to_string(witness).unwrap();
+    // A literal edit really changes the foreign input, so the final plan can
+    // rebuild it after restoration. The second plan must see its cached copy.
+    let compiled = |name: &str| {
+        plans
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(krate, _)| *krate == name)
+            .map(|(_, plan)| plan)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert!((1..3).contains(&compiled("foreign").len()), "{plans}");
+    assert_eq!(compiled("unrelated").len(), 1, "{plans}");
+}
