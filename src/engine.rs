@@ -19,6 +19,9 @@ use std::{
 
 #[derive(Args)]
 pub struct Options {
+    /// Use the specified rustc-dev compiler for MIR bundles and catalog fallbacks.
+    #[arg(long)]
+    mir_rustc: Option<PathBuf>,
     #[arg(short, long)]
     package: Option<String>,
     #[arg(long, default_value = "Cargo.toml")]
@@ -90,6 +93,8 @@ struct Baseline {
 }
 
 struct Engine<'a> {
+    compiler: Option<&'a crate::mir::Toolchain>,
+    plan: Option<&'a Path>,
     libraries_first: bool,
     timeout: Duration,
     options: &'a Options,
@@ -101,7 +106,15 @@ struct Engine<'a> {
     package: &'a str,
     pool: &'a rayon::ThreadPool,
 }
+// These hints choose a build strategy only. Each invocation still compiles
+// every batch and executes or otherwise classifies every catalog entry.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Routes {
+    source: BTreeSet<usize>,
+    literal: BTreeSet<usize>,
+}
 struct Report {
+    routes: Routes,
     results: Vec<(usize, Status)>,
     bundled: usize,
     builds: usize,
@@ -109,6 +122,19 @@ struct Report {
 impl Engine<'_> {
     fn command(&self) -> Command {
         let mut c = cargo();
+        if let Some(tc) = self.compiler {
+            tc.compiler(&mut c);
+            if let Some(plan) = self.plan {
+                tc.instrument(
+                    &mut c,
+                    &plan.join("rustc"),
+                    &self.root.join(self.package_dir),
+                    &plan.join("report"),
+                );
+                c.env("CARGO_ONLINE_MIR_PLAN", plan.join("sites"))
+                    .env("CARGO_INCREMENTAL", "0");
+            }
+        }
         c.current_dir(self.root)
             .env("CARGO_TARGET_DIR", &self.target)
             .env_remove("CARGO_ONLINE_MUTANT")
@@ -463,13 +489,126 @@ impl Engine<'_> {
         );
         Ok(results)
     }
-    fn batch(&self, ids: &[usize], report: &mut Report, literal: &mut Vec<usize>) -> Result<()> {
-        self.catalog.bundle(self.root, ids)?;
-        // A mutation may be ill-typed or valid only in its original context.
-        // Prove viability with its literal edit before reporting it unviable.
-        let (status, log) = self.build(true)?;
-        let compiled = status.is_some_and(|s| s.success());
-        let (usable, trace) = if compiled && self.options.workspace_coverage {
+    fn mir_batch(&self, ids: &[usize], report: &mut Report) -> Result<Vec<usize>> {
+        let Some(tc) = self.compiler else {
+            return Ok(ids.to_vec());
+        };
+        let (mut native, source): (Vec<_>, Vec<_>) = ids.iter().copied().partition(|&id| {
+            !report.routes.source.contains(&id)
+                && self
+                    .catalog
+                    .mir_site(self.root, id, &Default::default())
+                    .is_some()
+        });
+        if native.is_empty() {
+            return Ok(ids.to_vec());
+        }
+        let insertions = self.catalog.bundle(self.root, &source)?;
+        let sites: Vec<_> = native
+            .iter()
+            .filter_map(|&id| self.catalog.mir_site(self.root, id, &insertions))
+            .collect();
+        let dir = tempfile::tempdir_in(self.temp)?;
+        // Cargo fingerprints the workspace wrapper path. Give every immutable
+        // plan its own path, including cases where an invocation is retried.
+        fs::hard_link(tc.wrapper(), dir.path().join("rustc"))?;
+        fs::write(dir.path().join("sites"), sites.join("\n"))?;
+        let engine = Engine {
+            plan: Some(dir.path()),
+            target: self.target.clone(),
+            ..*self
+        };
+        let (status, log) = engine.build(true)?;
+        if !status.is_some_and(|s| s.success()) {
+            let suspects = self.diagnostic_variants(log.as_bytes(), &source)?;
+            self.catalog.restore(self.root, &source)?;
+            if !suspects.is_empty() {
+                for &id in &suspects {
+                    report.results.push(self.literal(id)?);
+                    report.routes.literal.insert(id);
+                }
+                let viable: Vec<_> = ids
+                    .iter()
+                    .copied()
+                    .filter(|i| !suspects.contains(i))
+                    .collect();
+                return self.mir_batch(&viable, report);
+            }
+            if std::env::var_os("CARGO_ONLINE_VERBOSE").is_some() {
+                eprintln!("{log}");
+            }
+            eprintln!("MIR build failed; retrying catalog source edits");
+            return Ok(ids.to_vec());
+        }
+        let attempted = native.clone();
+        let mut matched = BTreeSet::new();
+        let mut foreign = BTreeSet::new();
+        for entry in fs::read_dir(dir.path())? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with("foreign-") {
+                for line in fs::read_to_string(entry.path())?.lines() {
+                    let id: usize = line
+                        .strip_prefix("file ")
+                        .context("invalid foreign source report")?
+                        .parse()?;
+                    foreign.insert(id - 1);
+                }
+                continue;
+            }
+            if !entry.file_name().to_string_lossy().starts_with("unit-") {
+                continue;
+            }
+            let text = fs::read_to_string(entry.path())?;
+            let mut loaded = BTreeSet::new();
+            let mut counts = BTreeMap::new();
+            for line in text.lines() {
+                if let Some(id) = line.strip_prefix("file ") {
+                    loaded.insert(id.parse::<usize>()?);
+                } else {
+                    *counts.entry(line.parse::<usize>()?).or_insert(0usize) += 1;
+                }
+            }
+            native.retain(|id| !loaded.contains(&(id + 1)) || counts.get(&(id + 1)) == Some(&1));
+            matched.extend(counts.into_keys());
+        }
+        native.retain(|id| matched.contains(&(id + 1)) && !foreign.contains(id));
+        if std::env::var_os("CARGO_ONLINE_VERBOSE").is_some() {
+            eprintln!("MIR catalog indices: {native:?}");
+        }
+        report
+            .routes
+            .source
+            .extend(attempted.into_iter().filter(|id| !native.contains(id)));
+        let ready: BTreeSet<_> = native.iter().chain(&source).copied().collect();
+        let usable = !ready.is_empty()
+            && engine.run_bundle(&ready.iter().copied().collect::<Vec<_>>(), &log, report)?;
+        self.catalog.restore(self.root, &source)?;
+        // Another workspace target can compile the same source via #[path] or include!.
+        // Rebuild literal edits there, including copies consumed by build scripts.
+        for &id in &foreign {
+            report.results.push(self.literal(id)?);
+            report.routes.literal.insert(id);
+        }
+        if !usable {
+            return Ok(ids
+                .iter()
+                .copied()
+                .filter(|id| !foreign.contains(id))
+                .collect());
+        }
+        eprintln!(
+            "{} native MIR edits and {} source edits in one build",
+            native.len(),
+            source.len()
+        );
+        Ok(ids
+            .iter()
+            .copied()
+            .filter(|id| !ready.contains(id) && !foreign.contains(id))
+            .collect())
+    }
+    fn run_bundle(&self, ids: &[usize], log: &str, report: &mut Report) -> Result<bool> {
+        let (usable, trace) = if self.options.workspace_coverage {
             let trace = tempfile::NamedTempFile::new_in(self.temp)?;
             let mut cmd = self.command();
             cmd.env("CARGO_ONLINE_TRACE", trace.path())
@@ -480,16 +619,11 @@ impl Engine<'_> {
                 Some((pid, trace)),
             )
         } else {
-            (compiled && self.classify(None)? == Status::Survived, None)
-        };
-        let suspects = if compiled {
-            BTreeSet::new()
-        } else {
-            self.diagnostic_variants(log.as_bytes(), ids)?
+            (self.classify(None)? == Status::Survived, None)
         };
         if usable {
             let selected = if let Some((pid, trace)) = &trace {
-                match self.workspace_results(ids, &log, trace.path(), *pid) {
+                match self.workspace_results(ids, log, trace.path(), *pid) {
                     Ok(results) => Some(results),
                     Err(err) => {
                         eprintln!(
@@ -523,6 +657,20 @@ impl Engine<'_> {
             report.bundled += ids.len();
             report.builds += 1;
         }
+        Ok(usable)
+    }
+    fn batch(&self, ids: &[usize], report: &mut Report, literal: &mut Vec<usize>) -> Result<()> {
+        self.catalog.bundle(self.root, ids)?;
+        // A mutation may be ill-typed or valid only in its original context.
+        // Prove viability with its literal edit before reporting it unviable.
+        let (status, log) = self.build(true)?;
+        let compiled = status.is_some_and(|s| s.success());
+        let usable = compiled && self.run_bundle(ids, &log, report)?;
+        let suspects = if compiled {
+            BTreeSet::new()
+        } else {
+            self.diagnostic_variants(log.as_bytes(), ids)?
+        };
         self.catalog.restore(self.root, ids)?;
         if !usable {
             if ids.len() == 1 {
@@ -618,11 +766,38 @@ pub fn run(options: Options) -> Result<bool> {
         .num_threads(options.jobs.get())
         .build()?;
     let mut report = Report {
+        routes: Routes::default(),
         results: Vec::new(),
         bundled: 0,
         builds: 0,
     };
+    let compiler = options
+        .mir_rustc
+        .as_ref()
+        .map(|c| crate::mir::Toolchain::prepare(c, &cache))
+        .transpose()?;
     let mut workspace_baseline = None;
+    let route_path = {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::hash::DefaultHasher::new();
+        (
+            compiler.as_ref().map(|tc| &tc.directory),
+            std::env::var_os("RUSTC"),
+            &original,
+            &out.stdout,
+            options.lib,
+            options.test_workspace,
+            &options.features,
+            options.all_features,
+            options.no_default_features,
+        )
+            .hash(&mut hash);
+        catalog.hash_sources(&mut hash);
+        cache.join(format!("routes-{:016x}.json", hash.finish()))
+    };
+    if let Ok(bytes) = fs::read(&route_path) {
+        report.routes = serde_json::from_slice(&bytes).unwrap_or_default();
+    }
     for (package, ids) in packages {
         let manifest = meta["packages"]
             .as_array()
@@ -633,6 +808,8 @@ pub fn run(options: Options) -> Result<bool> {
         let path = crate::json_path(&manifest["manifest_path"])?;
         let package_dir = path.parent().unwrap().strip_prefix(&original)?;
         let mut engine = Engine {
+            compiler: compiler.as_ref(),
+            plan: None,
             libraries_first: false,
             timeout: options
                 .timeout
@@ -670,16 +847,19 @@ pub fn run(options: Options) -> Result<bool> {
                 cmd
             })
         });
-        let (runtime, mut literal): (Vec<_>, Vec<_>) = ids
-            .into_iter()
-            .partition(|&i| catalog.bundleable(i) && !host_code);
+        let (runtime, mut literal): (Vec<_>, Vec<_>) = ids.into_iter().partition(|&i| {
+            catalog.bundleable(i) && !host_code && !report.routes.literal.contains(&i)
+        });
         eprintln!(
             "{}: {} catalog candidates",
             package,
             runtime.len() + literal.len()
         );
         for batch in runtime.chunks(options.batch_size.get()) {
-            engine.batch(batch, &mut report, &mut literal)?;
+            let remaining = engine.mir_batch(batch, &mut report)?;
+            if !remaining.is_empty() {
+                engine.batch(&remaining, &mut report, &mut literal)?;
+            }
         }
         report.results.extend(engine.literals(&literal)?);
     }
@@ -692,6 +872,19 @@ pub fn run(options: Options) -> Result<bool> {
             .eq(0..catalog.edits.len()),
         "incomplete catalog results"
     );
+    {
+        // A previously ill-typed edit gets an independent compile on the next
+        // run. Schedule these builds across workers and keep them out of bundles.
+        report.routes.literal.extend(
+            report
+                .results
+                .iter()
+                .filter_map(|&(id, status)| (status == Status::Unviable).then_some(id)),
+        );
+        let tmp = tempfile::NamedTempFile::new_in(cache)?;
+        serde_json::to_writer(tmp.as_file(), &report.routes)?;
+        tmp.persist(route_path)?;
+    }
     let mut counts = BTreeMap::new();
     for &(id, s) in &report.results {
         *counts.entry(s).or_insert(0usize) += 1;

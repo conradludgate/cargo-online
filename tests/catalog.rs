@@ -325,3 +325,132 @@ fn workspace_coverage_keeps_downstream_kills_and_falls_back_for_doctests() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires CARGO_ONLINE_TEST_RUSTC with matching rustc-dev libraries"]
+fn native_catalog_and_source_arms_share_a_harness() {
+    let compiler = std::env::var_os("CARGO_ONLINE_TEST_RUSTC").unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    setup(root);
+    let content = "// résumé\r\npub fn value(x: u32) -> bool { let y = (|z:u32| z & 3)(x); y < 2 }\n#[test] fn controls() { let f: fn(u32)->bool = value; assert!(f(5)); assert!(!f(6)); }\n";
+    fs::write(root.join("src/lib.rs"), content).unwrap();
+    let mut cases = Vec::new();
+    for (i, (old, new)) in [
+        ("&", "|"),
+        ("<", ">"),
+        ("<", "=="),
+        ("let y = (|z:u32| z & 3)(x); y < 2", "true"),
+        ("3)", "0u32)"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let start = content.lines().nth(1).unwrap().find(old).unwrap() + 1;
+        cases.push(json!({"name":format!("edit {i}"),"package":"sample","file":"src/lib.rs","replacement":new,"span":{"start":{"line":2,"column":start},"end":{"line":2,"column":start+old.len()}}}));
+    }
+    fs::write(
+        root.join("catalog.json"),
+        serde_json::to_vec(&cases).unwrap(),
+    )
+    .unwrap();
+    let out = command(root)
+        .args(["--lib", "--mir-rustc"])
+        .arg(compiler)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("4 native MIR edits and 1 source edits in one build"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stdout.lines().filter(|s| s.starts_with("Killed\t")).count(),
+        5,
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        content
+    );
+}
+
+#[test]
+#[ignore = "requires CARGO_ONLINE_TEST_RUSTC with matching rustc-dev libraries"]
+fn workspace_mir_preserves_downstream_and_shared_source_kills() {
+    let compiler = std::env::var_os("CARGO_ONLINE_TEST_RUSTC").unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    setup(root);
+    fs::write(root.join("Cargo.toml"),"[workspace]\nmembers=['consumer']\n[package]\nname='sample'\nversion='0.1.0'\nedition='2024'").unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn selected(x:u8)->bool { x == 3 }\n",
+    )
+    .unwrap();
+    fs::write(root.join("tests/check.rs"), "").unwrap();
+    fs::create_dir_all(root.join("consumer/src")).unwrap();
+    fs::write(root.join("consumer/Cargo.toml"),"[package]\nname='consumer'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nsample={path='..'}").unwrap();
+    fs::write(root.join("catalog.json"), serde_json::to_vec(&[json!({"name":"comparison","package":"sample","file":"src/lib.rs","replacement":"!=","span":{"start":{"line":1,"column":33},"end":{"line":1,"column":35}}})]).unwrap()).unwrap();
+    for (import, expected) in [
+        ("use sample as subject;", "1 native MIR edits"),
+        (
+            "#[path=\"../../src/lib.rs\"] mod subject;",
+            "1 literal builds",
+        ),
+    ] {
+        fs::write(
+            root.join("consumer/src/lib.rs"),
+            format!("{import}\n#[test] fn downstream(){{assert!(subject::selected(3));}}"),
+        )
+        .unwrap();
+        let output = command(root)
+            .args(["--test-workspace", "--workspace-coverage", "--mir-rustc"])
+            .arg(&compiler)
+            .output()
+            .unwrap();
+        let log = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.status.success() && log.contains(expected) && log.contains("Killed\tcomparison"),
+            "{log}"
+        );
+    }
+}
+
+#[test]
+fn a_cached_build_route_never_reuses_an_unviable_verdict() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    setup(root);
+    fs::write(root.join("src/lib.rs"), format!("{SOURCE}\nmod extra;")).unwrap();
+    let extra = root.join("src/extra.rs");
+    fs::write(&extra, "").unwrap();
+    let path = root.join("catalog.json");
+    let mut catalog: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    catalog.retain(|c| c["name"] == "ill typed");
+    fs::write(path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+    let first = command(root).arg("--lib").output().unwrap();
+    assert!(
+        first.status.success()
+            && String::from_utf8_lossy(&first.stdout).contains("Unviable\till typed")
+    );
+    fs::write(
+        &extra,
+        "impl Default for crate::Token { fn default()->Self { Self } }",
+    )
+    .unwrap();
+    let second = command(root).arg("--lib").output().unwrap();
+    let output = String::from_utf8_lossy(&second.stdout);
+    assert_eq!(second.status.code(), Some(1), "{output}");
+    assert!(
+        output.contains("Survived\till typed") && output.contains("1 literal builds"),
+        "{output}"
+    );
+}

@@ -43,6 +43,7 @@ pub struct Edit {
 #[derive(Default)]
 struct Regions {
     spans: Vec<Range<usize>>,
+    comparisons: BTreeMap<usize, Range<usize>>,
 }
 
 // Dispatch arms share a type inference context. An opaque return type must
@@ -61,6 +62,24 @@ fn runtime_signature(sig: &syn::Signature) -> bool {
 }
 
 impl<'a> Visit<'a> for Regions {
+    fn visit_expr_binary(&mut self, e: &'a syn::ExprBinary) {
+        if matches!(
+            e.op,
+            syn::BinOp::Eq(_)
+                | syn::BinOp::Ne(_)
+                | syn::BinOp::Lt(_)
+                | syn::BinOp::Le(_)
+                | syn::BinOp::Gt(_)
+                | syn::BinOp::Ge(_)
+                | syn::BinOp::BitAnd(_)
+                | syn::BinOp::BitOr(_)
+                | syn::BinOp::BitXor(_)
+        ) {
+            self.comparisons
+                .insert(e.op.span().byte_range().start, e.span().byte_range());
+        }
+        visit::visit_expr_binary(self, e);
+    }
     fn visit_item_fn(&mut self, f: &'a syn::ItemFn) {
         if runtime_signature(&f.sig) {
             self.spans.push(f.block.span().byte_range());
@@ -87,7 +106,10 @@ struct Source {
     text: String,
     lines: Vec<usize>,
     regions: Vec<Range<usize>>,
+    comparisons: BTreeMap<usize, Range<usize>>,
 }
+
+type Insertions = BTreeMap<PathBuf, BTreeMap<usize, usize>>;
 
 impl Source {
     fn read(path: &Path) -> Result<Self> {
@@ -100,6 +122,11 @@ impl Source {
             let prefix = usize::from(text.starts_with('\u{feff}')) * 3
                 + file.shebang.as_ref().map_or(0, String::len);
             regions.visit_file(&file);
+            regions.comparisons = regions
+                .comparisons
+                .into_iter()
+                .map(|(op, r)| (op + prefix, r.start + prefix..r.end + prefix))
+                .collect();
             for r in &mut regions.spans {
                 r.start += prefix;
                 r.end += prefix;
@@ -109,6 +136,7 @@ impl Source {
             text,
             lines,
             regions: regions.spans,
+            comparisons: regions.comparisons,
         })
     }
     fn offset(&self, pos: &Position) -> Result<usize> {
@@ -179,6 +207,57 @@ impl Catalog {
         }
         Ok(Self { sources, edits })
     }
+    pub fn hash_sources(&self, state: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        for source in self.sources.values() {
+            source.text.hash(state);
+        }
+    }
+    pub fn mir_site(&self, root: &Path, id: usize, insertions: &Insertions) -> Option<String> {
+        let e = &self.edits[id];
+        let source = &self.sources[&e.file];
+        let to = e.replacement.as_str();
+        let original = &source.text[e.range.clone()];
+        let comparisons = ["==", "!=", "<", "<=", ">", ">="];
+        let bitwise = ["&", "|", "^"];
+        let (from, r) = if [comparisons.as_slice(), bitwise.as_slice()]
+            .iter()
+            .any(|ops| ops.contains(&original) && ops.contains(&to))
+        {
+            (original, source.comparisons.get(&e.range.start)?)
+        } else if ["0", "1", "-1", "true", "false"].contains(&to) {
+            let block = e.region.as_ref()?;
+            if e.range.start <= block.start
+                || e.range.end >= block.end
+                || !source.text[block.start + 1..e.range.start]
+                    .trim()
+                    .is_empty()
+                || !source.text[e.range.end..block.end - 1].trim().is_empty()
+            {
+                return None;
+            }
+            ("return", block)
+        } else {
+            return None;
+        };
+        // The baseline text remains in order inside source dispatchers. A
+        // return site spans the whole generated function block, including its switch.
+        let offset = |pos, inclusive| {
+            pos + insertions
+                .get(&e.file)
+                .into_iter()
+                .flat_map(|m| m.range(..=pos))
+                .filter(|(p, _)| inclusive || **p < pos)
+                .map(|(_, n)| n)
+                .sum::<usize>()
+        };
+        let start = offset(r.start, from != "return");
+        let end = offset(r.end, from == "return");
+        let path = root.join(&e.file).canonicalize().ok()?;
+        let path = path.to_str()?;
+        (!path.contains(['\t', '\n', '\r']))
+            .then(|| format!("{}\t{}\t{}\t{from}\t{to}\t{path}", id + 1, start, end))
+    }
     pub fn restore(&self, root: &Path, ids: &[usize]) -> Result<()> {
         let paths: std::collections::BTreeSet<_> =
             ids.iter().map(|&i| &self.edits[i].file).collect();
@@ -197,7 +276,8 @@ impl Catalog {
     pub fn bundleable(&self, id: usize) -> bool {
         self.edits[id].region.is_some()
     }
-    pub fn bundle(&self, root: &Path, ids: &[usize]) -> Result<()> {
+    pub fn bundle(&self, root: &Path, ids: &[usize]) -> Result<Insertions> {
+        let mut insertions = Insertions::new();
         let mut files = BTreeMap::<_, Vec<_>>::new();
         for &id in ids {
             files.entry(&self.edits[id].file).or_default().push(id);
@@ -212,21 +292,8 @@ impl Catalog {
                     .context("missing dispatch region")?;
                 regions.entry((r.start, r.end)).or_default().push(id);
             }
-            // Fold nested regions into their parents. Only the baseline arm needs
-            // inner switches because each process activates at most one mutant.
-            let mut regions: Vec<_> = regions.into_iter().collect();
-            regions.sort_by_key(|((a, b), _)| (*a, std::cmp::Reverse(*b)));
-            let mut fragments: Vec<(Range<usize>, String)> = Vec::new();
-            for ((a, b), variants) in regions.into_iter().rev() {
-                let mut baseline = source[a..b].to_owned();
-                let first = fragments
-                    .iter()
-                    .position(|(r, _)| r.start < b)
-                    .unwrap_or(fragments.len());
-                for (r, text) in fragments.drain(first..) {
-                    ensure!(r.start >= a && r.end <= b, "overlapping dispatch regions");
-                    baseline.replace_range(r.start - a..r.end - a, &text);
-                }
+            let mut additions = BTreeMap::<usize, String>::new();
+            for ((a, b), variants) in regions {
                 // Local extern crate also works in host-tested no_std packages
                 // and in nested modules, integration tests, and binary targets.
                 let hits = variants
@@ -244,16 +311,25 @@ impl Catalog {
                         id + 1
                     ));
                 }
-                switch.push_str(&format!("_ => {{ {baseline} }} }} }}"));
-                fragments.push((a..b, switch));
+                switch.push_str("_ => { ");
+                additions.entry(a).or_default().push_str(&switch);
+                additions.entry(b).or_default().push_str(" } } }");
             }
-            let mut output = source.clone();
-            for (r, s) in fragments {
-                output.replace_range(r, &s);
+            let mut output = String::new();
+            let mut last = 0;
+            for (at, value) in additions {
+                output.push_str(&source[last..at]);
+                output.push_str(&value);
+                last = at;
+                insertions
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(at, value.len());
             }
+            output.push_str(&source[last..]);
             fs::write(root.join(path), output)?;
         }
-        Ok(())
+        Ok(insertions)
     }
 }
 

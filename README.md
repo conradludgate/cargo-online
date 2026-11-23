@@ -34,6 +34,18 @@ With `--test-workspace --workspace-coverage`, the unmutated bundle runs the sele
 
 The native Linux runner copies the current workspace and keeps incremental artifacts under Cargo's target directory. Tests within a bundle share the copy. Use `-j 1` for suites that need exclusive access to external resources.
 
+### Compiler-backed catalog execution
+
+On native x86-64 Linux, pass the path to rustc from a toolchain with matching `rustc-dev` and LLVM libraries. The private driver was built against `1.102.0-nightly (a267dc927)`. The CLI builds the driver on first use and caches it under the target directory.
+
+```sh
+cargo online mutate --mir-rustc "$MIR_RUSTC" --test-workspace --workspace-coverage
+```
+
+The compiler matches primitive comparisons, bitwise operators and scalar function-body replacements by source span and operand or return type. One executable can contain both MIR and source variants. The native selector runs inside the function, including calls through function pointers. The driver checks the mapping in each compilation that loads the file. Ambiguous sites go through source dispatch or a literal build. A separately compiled workspace copy of the same native site requires a literal edit.
+
+Both engines remember which candidates previously needed independent compilation. On a repeat they can send those edits straight to parallel literal workers. The cache holds build choices. Every candidate still receives a fresh classification.
+
 ### Comparison-only mode
 
 The original runner flips runtime comparison results and uses the standard library unit-test harness. It can run independently of cargo-mutants:
@@ -129,7 +141,7 @@ cargo online mutate-comparisons -p rustyguard-core -j 4 --timeout 45 --full
 
 ## Longer-term design
 
-The long-term goal is an incremental Rust development compiler and test engine: rebuild only what changed, automatically run impacted tests, and share compiler analysis and machine code across mutation variants. The sections below describe the proposed compiler and watch architecture. The current mutation engine uses source instrumentation and Cargo test builds.
+The long-term goal is an incremental Rust development compiler and test engine: rebuild only what changed, automatically run impacted tests, and share compiler analysis and machine code across mutation variants. The sections below describe the proposed compiler and watch architecture. The mutation engine supports both source dispatch and an optional Cargo workspace compiler wrapper.
 
 ## The developer experience
 
@@ -378,4 +390,4 @@ A worthwhile early prototype is *just* automatic selected-test execution with an
 
 ---
 
-**Status:** The CLI uses source-level bundled mutation testing. A [standalone rustc driver experiment](experiments/mir-equality.rs) rewrites a single primitive equality in optimized MIR at a cargo-mutants source position. It requires a matching nightly compiler and rustc-dev libraries. Watch mode, multi-mutant MIR builds, and the fine-grained compiler cache remain design proposals.
+**Status:** The catalog runner supports mixed MIR and source bundles on the pinned compiler, with independent Cargo builds for remaining edits. The [standalone equality experiment](experiments/mir-equality.rs) demonstrates the original single-site query override.
