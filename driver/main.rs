@@ -1,5 +1,6 @@
 //! Cargo workspace rustc wrapper for the compiler revision documented in README.
 #![feature(rustc_private)]
+extern crate rustc_attr_ir;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_hir;
@@ -27,6 +28,8 @@ use std::{
     process::{Command, ExitCode},
     sync::{Mutex, OnceLock},
 };
+
+mod codegen;
 
 struct Site {
     id: u64,
@@ -438,6 +441,12 @@ impl rustc_driver::Callbacks for Callbacks {
         }
         c.override_queries = Some(|_, p| {
             ORIGINAL.set(p.queries.optimized_mir).unwrap();
+            if env::var_os("CARGO_ONLINE_INSTANCE_CODEGEN").is_some() {
+                codegen::ORIGINAL
+                    .set(p.queries.collect_and_partition_mono_items)
+                    .unwrap();
+                p.queries.collect_and_partition_mono_items = codegen::partition;
+            }
             p.queries.optimized_mir = transform;
         });
     }

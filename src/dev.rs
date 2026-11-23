@@ -38,6 +38,9 @@ pub struct Options {
     /// Use cargo-nextest process isolation for the selected library tests.
     #[arg(long, requires = "lib")]
     nextest: bool,
+    /// Give eligible monomorphised functions individual incremental codegen units.
+    #[arg(long)]
+    instance_codegen: bool,
     /// Rebuild after edits and cancel superseded runs.
     #[arg(long)]
     watch: bool,
@@ -315,6 +318,7 @@ pub fn run(o: Options) -> Result<bool> {
         &root,
         &libraries,
         o.lib,
+        o.instance_codegen,
         o.nextest,
         o.all_features,
         o.no_default_features,
@@ -354,6 +358,9 @@ pub fn run(o: Options) -> Result<bool> {
             .env_remove("CARGO_ONLINE_DEV_TRACE")
             .env_remove("CARGO_ONLINE_MUTANT");
         tc.instrument(&mut c, &tc.wrapper(), &root, &report);
+        if o.instance_codegen {
+            c.env("CARGO_ONLINE_INSTANCE_CODEGEN", "1");
+        }
         c.env("CARGO_ONLINE_MIR_SOURCES", &source_paths)
             .env("CARGO_ONLINE_MIR_DEV", "1");
         if o.all_features {

@@ -122,6 +122,80 @@ fn check_cancellation(flags: &[&str]) {
 }
 
 #[test]
+#[ignore = "requires CARGO_ONLINE_TEST_RUSTC with matching rustc-dev libraries"]
+fn incremental_codegen_reuses_an_unchanged_function_object() {
+    use std::{collections::BTreeMap, os::unix::fs::MetadataExt};
+    let compiler = std::env::var_os("CARGO_ONLINE_TEST_RUSTC").unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='instances'\nversion='0.0.0'\nedition='2024'",
+    )
+    .unwrap();
+    let original = "pub fn eq(x:u8,y:u8)->bool { x == y }\npub fn lt(x:u8,y:u8)->bool { x < y }\n#[test] fn alpha(){assert!(eq(1,1));}\n#[test] fn beta(){assert!(lt(1,2));}";
+    let source = root.join("src/lib.rs");
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_cargo-online"))
+            .current_dir(root)
+            .env_remove("CARGO_TARGET_DIR")
+            .env("CARGO_INCREMENTAL", "1")
+            .args(["dev", "--lib", "--instance-codegen", "--mir-rustc"])
+            .arg(&compiler)
+            .output()
+            .unwrap()
+    };
+    let objects = || {
+        let mut found = BTreeMap::new();
+        for e in walkdir::WalkDir::new(root.join("target")) {
+            let e = e.unwrap();
+            let name = e.file_name().to_string_lossy();
+            if name.starts_with("co_") && name.ends_with(".o") {
+                // rustc may keep two generations. Inspect the newest snapshot.
+                let generation = e.path().parent().unwrap().file_name().unwrap().to_owned();
+                let stamp = (generation, e.metadata().unwrap().ino());
+                let entry = found
+                    .entry(name.into_owned())
+                    .or_insert_with(|| stamp.clone());
+                if stamp > *entry {
+                    *entry = stamp;
+                }
+            }
+        }
+        found
+    };
+    fs::write(&source, original).unwrap();
+    let control = run();
+    assert!(
+        control.status.success(),
+        "{}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    let before = objects();
+    assert!(before.len() >= 2, "{before:?}");
+    fs::write(&source, original.replace("x == y", "x != y")).unwrap();
+    let changed = run();
+    assert!(
+        !changed.status.success()
+            && String::from_utf8_lossy(&changed.stdout).contains("alpha ... FAILED")
+    );
+    let after = objects();
+    assert!(
+        before
+            .iter()
+            .any(|(name, (_, inode))| after.get(name).is_some_and(|(_, now)| now == inode)),
+        "{before:?} {after:?}"
+    );
+    assert!(
+        before
+            .iter()
+            .any(|(name, (_, inode))| after.get(name).is_some_and(|(_, now)| now != inode)),
+        "{before:?} {after:?}"
+    );
+}
+
+#[test]
 #[ignore = "requires CARGO_ONLINE_TEST_RUSTC and cargo-nextest on PATH"]
 fn nextest_prioritises_a_covered_library_failure() {
     let compiler = std::env::var_os("CARGO_ONLINE_TEST_RUSTC").unwrap();

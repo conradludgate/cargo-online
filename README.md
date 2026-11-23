@@ -153,6 +153,12 @@ The driver instruments the selected library test harnesses, fingerprints functio
 
 `--watch` cancels the superseded process group on an edit and reuses Cargo's incremental target. The CLI reports time to the first test result, first failure and completion. Run `experiments/edit-latency.sh "$MIR_RUSTC"` from this checkout after a release build to reproduce the controlled edit benchmark.
 
+### Incremental function objects
+
+Add `--instance-codegen` to a development run to try finer-grained object reuse. The driver consults rustc's monomorphised item graph and splits eligible local functions into individually named codegen units. Items with explicit linkage, local inline copies, and functions that need a private symbol in their original unit keep their original placement. Rustc tracks dependencies, reuses valid object files and relinks the test executable. This experimental mode uses a separate incremental target. More objects can increase codegen and link time.
+
+The integration test changes one of two functions, checks that the edited object's inode changed and that rustc reused the other object's inode, and observes the intended failing test. On Rama revision `a8e7406af`, the driver isolated 15 instances in 59 codegen units for `rama-error`. All 45 library tests passed.
+
 ## Longer-term design
 
 The long-term goal is an incremental Rust development compiler and test engine: rebuild only what changed, automatically run impacted tests, and share compiler analysis and machine code across mutation variants. The sections below describe the proposed compiler and watch architecture. The mutation engine supports both source dispatch and an optional Cargo workspace compiler wrapper.
@@ -404,4 +410,4 @@ A worthwhile early prototype is *just* automatic selected-test execution with an
 
 ---
 
-**Status:** The catalog runner supports mixed MIR and source bundles on the pinned compiler, with independent Cargo builds for remaining edits. The [standalone equality experiment](experiments/mir-equality.rs) demonstrates the original single-site query override.
+**Status:** The catalog runner supports mixed MIR and source bundles on the pinned compiler, with independent Cargo builds for remaining edits. Development mode supports coverage-based prioritisation, watch cancellation and experimental per-instance object reuse. Incremental linking and a frontend that retains query state in memory across edits remain open. The [standalone equality experiment](experiments/mir-equality.rs) demonstrates the original single-site query override.

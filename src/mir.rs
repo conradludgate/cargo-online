@@ -41,6 +41,7 @@ impl Toolchain {
             version,
             &sysroot,
             include_str!("../driver/main.rs"),
+            include_str!("../driver/codegen.rs"),
             include_str!("../driver/runtime.rs"),
         )
             .hash(&mut hash);
@@ -50,6 +51,7 @@ impl Toolchain {
         if !directory.exists() {
             let temp = tempfile::tempdir_in(cache)?;
             let p = temp.path();
+            fs::write(p.join("codegen.rs"), include_str!("../driver/codegen.rs"))?;
             for (name, source, flags, out) in [
                 (
                     "runtime.rs",
@@ -112,6 +114,7 @@ impl Toolchain {
             .env("CARGO_ONLINE_MIR_REPORT", report)
             .env("CARGO_ONLINE_MIR_PACKAGE", package)
             .env_remove("CARGO_ONLINE_MIR_SOURCES")
+            .env_remove("CARGO_ONLINE_INSTANCE_CODEGEN")
             .env_remove("CARGO_ONLINE_MIR_DEV")
             .env_remove("CARGO_ONLINE_MIR_PLAN");
     }
