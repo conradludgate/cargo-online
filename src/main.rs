@@ -1,4 +1,5 @@
 mod catalog;
+mod dev;
 mod engine;
 mod host;
 mod instrument;
@@ -28,6 +29,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Prioritise tests after an edit using compiler-instrumented library tests.
+    Dev(dev::Options),
     /// Run the cargo-mutants catalog using shared builds.
     Mutate(engine::Options),
     /// Compile comparison mutants together and run affected library unit tests.
@@ -95,6 +98,7 @@ fn snapshot(root: &Path, dest: &Path, target: &Path) -> Result<()> {
 
 fn run(action: Action) -> Result<bool> {
     match action {
+        Action::Dev(opts) => dev::run(opts),
         Action::Mutate(options) => engine::run(options),
         Action::MutateComparisons(options) => comparisons(options),
     }

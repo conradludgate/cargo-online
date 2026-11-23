@@ -139,6 +139,20 @@ cargo online mutate-comparisons -p rustyguard-core -j 4 --timeout 45
 cargo online mutate-comparisons -p rustyguard-core -j 4 --timeout 45 --full
 ```
 
+## Edit-to-test feedback
+
+```sh
+cargo online dev --mir-rustc "$MIR_RUSTC" --workspace --watch
+cargo online dev --mir-rustc "$MIR_RUSTC" -p my-library --lib --nextest
+cargo online dev --mir-rustc "$MIR_RUSTC" -p my-library --lib --fast
+```
+
+The driver instruments the selected library test harnesses, fingerprints function bodies using source and optimized MIR, and records which functions ran on each named test thread. A virtual workspace selects all member libraries. Use `--workspace` at a package root to track all member libraries, or `-p` to focus on one. The next run tries previously failing tests and tests observed in changed functions first. A failure is reported immediately. After a passing priority run, the default validates the workspace, including integration tests and doctests. `--lib` limits validation to library unit tests. `--full` starts with the full chosen suite. With `--lib --nextest`, cargo-nextest runs the library tests in separate processes.
+
+`--fast` is an opt-in heuristic for one library. A partial pass requires a previously observed test for every changed body, successful execution of all selected tests and an unchanged workspace fingerprint outside ordinary top-level function bodies in that library's root source file. Changes to modules in other files, test declarations, manifests or unobserved functions take the full library path. A partial pass retains the coverage history of the last full run. External data, threads without a test identity and changes to execution paths can affect observed coverage.
+
+`--watch` cancels the superseded process group on an edit and reuses Cargo's incremental target. The CLI reports time to the first test result, first failure and completion. Run `experiments/edit-latency.sh "$MIR_RUSTC"` from this checkout after a release build to reproduce the controlled edit benchmark.
+
 ## Longer-term design
 
 The long-term goal is an incremental Rust development compiler and test engine: rebuild only what changed, automatically run impacted tests, and share compiler analysis and machine code across mutation variants. The sections below describe the proposed compiler and watch architecture. The mutation engine supports both source dispatch and an optional Cargo workspace compiler wrapper.
@@ -148,7 +162,7 @@ The long-term goal is an incremental Rust development compiler and test engine: 
 Start a watch session:
 
 ```sh
-cargo online dev                 # proposed command; not implemented
+cargo online dev --mir-rustc "$MIR_RUSTC" --workspace --watch
 ```
 
 On every save, the tool should:
