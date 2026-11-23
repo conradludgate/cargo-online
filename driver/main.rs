@@ -533,6 +533,23 @@ fn main() -> ExitCode {
         let e = Command::new(&args[0]).args(&args[1..]).exec();
         panic!("{e}")
     }
+    if selected && !dev {
+        // The query override reads a mutation plan outside rustc's dependency
+        // graph. Always recompute the owner's MIR. Ordinary dependent units
+        // retain Cargo's incremental cache and its normal invalidation rules.
+        let mut original = args.into_iter();
+        args = Vec::new();
+        while let Some(arg) = original.next() {
+            if arg == "-C" {
+                let value = original.next().expect("missing rustc codegen option");
+                if !value.starts_with("incremental=") {
+                    args.extend([arg, value]);
+                }
+            } else if !arg.starts_with("-Cincremental=") {
+                args.push(arg);
+            }
+        }
+    }
     let sites: Vec<Site> = env::var_os("CARGO_ONLINE_MIR_PLAN")
         .map(|p| {
             fs::read_to_string(p)

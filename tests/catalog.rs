@@ -666,16 +666,26 @@ fn successive_mir_batches_reuse_unrelated_units_and_remember_foreign_sources() {
     fs::write(
         &shim,
         r#"#!/bin/sh
+crate=''
+incremental=''
+prev=''
+for arg in "$@"; do
+    if [ "$prev" = --crate-name ]; then crate=$arg; fi
+    case "$arg" in
+        incremental=*) incremental=${arg#incremental=} ;;
+        -Cincremental=*) incremental=${arg#-Cincremental=} ;;
+    esac
+    prev=$arg
+done
 if [ -n "$CARGO_ONLINE_MIR_PLAN" ]; then
-    prev=''
-    for arg in "$@"; do
-        if [ "$prev" = --crate-name ]; then
-            echo "$arg $CARGO_ONLINE_MIR_PLAN" >> "$COMPILED_PLANS"
-        fi
-        prev=$arg
-    done
+    echo "$crate $CARGO_ONLINE_MIR_PLAN" >> "$COMPILED_PLANS"
 fi
-exec "$@"
+"$@"
+result=$?
+if [ "$result" = 0 ] && [ -n "$CARGO_ONLINE_MIR_PLAN" ] && [ "$crate" = unrelated ]; then
+    test -n "$incremental" && test -d "$incremental" || exit 95
+fi
+exit "$result"
 "#,
     )
     .unwrap();

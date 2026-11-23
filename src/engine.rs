@@ -154,7 +154,7 @@ impl Engine<'_> {
                         "CARGO_ONLINE_MIR_SOURCE_INDEX",
                         driver.path().join("sources"),
                     )
-                    .env("CARGO_INCREMENTAL", "0");
+                    .env("CARGO_INCREMENTAL", "1");
             }
         }
         c.current_dir(self.root)
