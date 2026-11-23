@@ -107,6 +107,16 @@ With the pinned MIR driver, a separate run used all workspace library tests and 
 
 On this revision, the pinned nightly enables six obsolete nightly-only benches in the `rama-http-headers` test harness. For both runs a compiler wrapper removed that crate's `--cfg nightly` only when compiling its test harness. Tests had access to local sockets. A repeat using nightly Cargo also stopped at the unmodified baseline because two gRPC example tests read `OUT_DIR` at runtime and that invocation omitted it.
 
+#### Unfiltered workspace suite with the MIR driver
+
+At `191f2ff`, the pinned driver ran the same five-candidate shard with `--test-workspace --full`. The clean workspace suite took 227.6 s and reported 9,261 passing tests before doctests and 652 passing doctests. The run took 1,432.185 s end to end. Cargo spent 270.91 s in explicit builds and 1,157.60 s in test invocations. Other benchmark processes overlapped part of the run.
+
+The outcomes matched the earlier unfiltered run by name. The fuzz-input edit survived, the two return replacements in `rama-core` and `rama-http-core` were unviable, and the `rama-net` path-matcher edit failed a library test. A `NonEmptyVec::binary_search_by_key` doctest killed the `rama-utils` edit. The runner used one shared source build and four individual builds. This shard exercises full-suite compatibility and contains no native MIR variants.
+
+A disjoint four-candidate shard (`8192/16384`, round-robin) took 1,120.460 s. It found two kills and two unviable edits, all from individual builds. A downstream gRPC example caught the `rama-http-types::decode_int` HPACK comparison. Together, these two shards establish nine outcomes from the 67,884-member catalog.
+
+The benchmark copy enabled the nightly test crate and provided the six header benches with the current `TypedHeader` trait under their expected name. It also used the pinned nightly's diagnostic text for the existing `case-warning.rs` compile-fail test. All six benches and the diagnostic test passed. The original and configured workspace produced byte-identical lists of all 67,884 candidates.
+
 ### Rustyguard benchmark
 
 #### Full cargo-mutants catalog
