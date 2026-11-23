@@ -103,7 +103,7 @@ fn executes_catalog_with_shared_and_literal_builds() {
             ],
         ),
         (
-            vec!["--lib"],
+            vec!["--lib", "--stream"],
             vec!["Killed\treturn value", "Uncovered\tsurvivor"],
         ),
     ] {
@@ -123,10 +123,55 @@ fn executes_catalog_with_shared_and_literal_builds() {
         }
         assert!(stdout.contains("11 catalog mutants"), "{stdout}");
         assert_eq!(
+            stdout.lines().filter(|line| line.contains('\t')).count(),
+            11
+        );
+        assert_eq!(
             fs::read_to_string(temp.path().join("src/lib.rs")).unwrap(),
             SOURCE
         );
     }
+}
+
+#[test]
+fn stream_preserves_completed_outcomes_on_a_later_infrastructure_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    setup(root);
+    let path = root.join("catalog.json");
+    let mut catalog: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    catalog.retain(|entry| {
+        matches!(
+            entry["name"].as_str(),
+            Some("operator precedence" | "survivor")
+        )
+    });
+    fs::write(path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+    let shim = root.join("cargo-shim");
+    fs::write(
+        &shim,
+        r#"#!/bin/sh
+if [ "$1" = test ] && [ "$CARGO_ONLINE_MUTANT" = 2 ]; then
+    echo 'simulated interruption' >&2
+    exit 79
+fi
+exec cargo "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = command(root)
+        .args(["--stream", "--batch-size", "1"])
+        .env("CARGO", shim)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("simulated interruption"));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "Killed\toperator precedence\n"
+    );
 }
 
 #[test]

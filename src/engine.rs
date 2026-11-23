@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::{self, Write},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
@@ -40,6 +41,9 @@ pub struct Options {
     /// List the selected catalog without building.
     #[arg(long)]
     list: bool,
+    /// Print confirmed outcomes as they become available.
+    #[arg(long, conflicts_with = "list")]
+    stream: bool,
     /// Run tests across the whole workspace for each mutation.
     #[arg(long)]
     test_workspace: bool,
@@ -120,6 +124,15 @@ struct Report {
     builds: usize,
 }
 impl Engine<'_> {
+    fn completed(&self, id: usize, status: Status) -> Result<(usize, Status)> {
+        if self.options.stream {
+            let mut output = io::stdout().lock();
+            writeln!(output, "{status:?}\t{}", self.catalog.edits[id].name)?;
+            output.flush()?;
+        }
+        Ok((id, status))
+    }
+
     fn command(&self) -> Command {
         let mut c = cargo();
         if let Some(tc) = self.compiler {
@@ -296,7 +309,7 @@ impl Engine<'_> {
             Status::Unviable
         };
         self.catalog.restore(self.root, &[id])?;
-        Ok((id, status))
+        self.completed(id, status)
     }
     // Diagnostics only select candidates to retry. A literal build determines
     // their actual viability, including failures caused by the dispatcher.
@@ -646,10 +659,15 @@ impl Engine<'_> {
                 None
             };
             let results = match selected {
-                Some(outcomes) => outcomes,
+                // Selection can fall back to the full suite. Publish only
+                // after the selected results have been accepted as a group.
+                Some(outcomes) => outcomes
+                    .into_iter()
+                    .map(|(id, status)| self.completed(id, status))
+                    .collect::<Result<Vec<_>>>()?,
                 None => self.pool.install(|| {
                     ids.par_iter()
-                        .map(|&i| Ok((i, self.classify(Some(i))?)))
+                        .map(|&i| self.completed(i, self.classify(Some(i))?))
                         .collect::<Result<Vec<_>>>()
                 })?,
             };
@@ -892,7 +910,9 @@ pub fn run(options: Options) -> Result<bool> {
     let mut counts = BTreeMap::new();
     for &(id, s) in &report.results {
         *counts.entry(s).or_insert(0usize) += 1;
-        println!("{s:?}\t{}", catalog.edits[id].name);
+        if !options.stream {
+            println!("{s:?}\t{}", catalog.edits[id].name);
+        }
     }
     println!(
         "{} catalog mutants, {} in {} shared builds, {} literal builds; elapsed {:.3}s",
