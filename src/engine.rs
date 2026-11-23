@@ -837,15 +837,19 @@ pub fn run(options: Options) -> Result<bool> {
         engine.libraries_first = baseline.libraries_first;
         let snapshot_manifest = root.join(path.strip_prefix(&original)?);
         let host_code = baseline.artifacts.as_ref().is_none_or(|build| {
-            build.needs_literal(&snapshot_manifest, || {
-                let mut cmd = cargo();
-                cmd.current_dir(&root).arg("metadata");
-                if !options.test_workspace {
-                    cmd.arg("--manifest-path").arg(&snapshot_manifest);
-                }
-                options.feature_args(&mut cmd);
-                cmd
-            })
+            build.needs_literal(
+                &snapshot_manifest,
+                || engine.command(),
+                || {
+                    let mut cmd = cargo();
+                    cmd.current_dir(&root).arg("metadata");
+                    if !options.test_workspace {
+                        cmd.arg("--manifest-path").arg(&snapshot_manifest);
+                    }
+                    options.feature_args(&mut cmd);
+                    cmd
+                },
+            )
         });
         let (runtime, mut literal): (Vec<_>, Vec<_>) = ids.into_iter().partition(|&i| {
             catalog.bundleable(i) && !host_code && !report.routes.literal.contains(&i)

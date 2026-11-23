@@ -454,3 +454,73 @@ fn a_cached_build_route_never_reuses_an_unviable_verdict() {
         "{output}"
     );
 }
+
+#[test]
+#[ignore = "requires CARGO_ONLINE_TEST_CARGO with unit-graph support and CARGO_ONLINE_TEST_RUSTC"]
+fn host_units_separate_build_dependencies_from_runtime_features() {
+    let compiler = std::env::var_os("CARGO_ONLINE_TEST_RUSTC").unwrap();
+    let cargo = std::env::var_os("CARGO_ONLINE_TEST_CARGO").unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    setup(root);
+    fs::write(root.join("Cargo.toml"),"[workspace]\nresolver='2'\nmembers=['bridge','consumer']\n[package]\nname='sample'\nversion='0.1.0'\nedition='2021'").unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn weak(x:u8)->bool { x == 5 }",
+    )
+    .unwrap();
+    fs::write(root.join("tests/check.rs"), "").unwrap();
+    for name in ["bridge", "consumer"] {
+        fs::create_dir_all(root.join(name).join("src")).unwrap();
+    }
+    fs::write(root.join("bridge/Cargo.toml"),"[package]\nname='bridge'\nversion='0.1.0'\nedition='2021'\n[features]\nruntime=['dep:sample']\n[dependencies]\nsample={path='..',optional=true}").unwrap();
+    fs::write(root.join("bridge/src/lib.rs"),"#[cfg(feature=\"runtime\")] pub fn value()->bool { sample::weak(5) }\n#[cfg(not(feature=\"runtime\"))] pub fn value()->bool { true }").unwrap();
+    fs::write(root.join("consumer/Cargo.toml"),"[package]\nname='consumer'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nbridge={path='../bridge',features=['runtime']}\n[build-dependencies]\nbridge={path='../bridge'}").unwrap();
+    fs::write(
+        root.join("consumer/build.rs"),
+        "fn main(){assert!(bridge::value());}",
+    )
+    .unwrap();
+    fs::write(
+        root.join("consumer/src/lib.rs"),
+        "#[test] fn downstream(){assert!(bridge::value());}",
+    )
+    .unwrap();
+    let start = "pub fn weak(x:u8)->bool { x ".len() + 1;
+    fs::write(root.join("catalog.json"),serde_json::to_vec(&[json!({"name":"runtime-only","package":"sample","file":"src/lib.rs","replacement":"!=","span":{"start":{"line":1,"column":start},"end":{"line":1,"column":start+2}}})]).unwrap()).unwrap();
+    let run = |program: &std::ffi::OsStr| {
+        let result = command(root)
+            .env("CARGO", program)
+            .env("CARGO_ONLINE_GRAPH_TEST_CARGO", &cargo)
+            .args(["--test-workspace", "--lib", "--mir-rustc"])
+            .arg(&compiler)
+            .output()
+            .unwrap();
+        let log = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stderr),
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert!(
+            result.status.success() && log.contains("Killed\truntime-only"),
+            "{log}"
+        );
+        log
+    };
+    let native = run(&cargo);
+    assert!(native.contains("1 native MIR edits"), "{native}");
+    let shim = root.join("cargo-no-unit-graph");
+    fs::write(
+        &shim,
+        r#"#!/bin/sh
+for arg do
+    [ "$arg" != "--unit-graph" ] || exit 1
+done
+exec "$CARGO_ONLINE_GRAPH_TEST_CARGO" "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let fallback = run(shim.as_os_str());
+    assert!(fallback.contains("1 literal builds"), "{fallback}");
+}

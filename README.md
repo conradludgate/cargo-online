@@ -44,6 +44,8 @@ cargo online mutate --mir-rustc "$MIR_RUSTC" --test-workspace --workspace-covera
 
 The compiler matches primitive comparisons, bitwise operators and scalar function-body replacements by source span and operand or return type. One executable can contain both MIR and source variants. The native selector runs inside the function, including calls through function pointers. The driver checks the mapping in each compilation that loads the file. Ambiguous sites go through source dispatch or a literal build. A separately compiled workspace copy of the same native site requires a literal edit.
 
+When the invoking Cargo supports the version-1 unit graph, the runner checks its package, target and feature sets against the clean compilation artifacts. It follows individual build-script and proc-macro dependencies in that graph. This lets a runtime feature of a library use a shared build even when a different build-time instance of its parent disables that feature. With stable Cargo the runner uses its conservative package-graph check. Set `CARGO` to a nightly Cargo executable to use unit graphs.
+
 Both engines remember which candidates previously needed independent compilation. On a repeat they can send those edits straight to parallel literal workers. The cache holds build choices. Every candidate still receives a fresh classification.
 
 ### Comparison-only mode

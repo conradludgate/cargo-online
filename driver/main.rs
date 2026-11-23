@@ -514,9 +514,14 @@ fn main() -> ExitCode {
     })
     .ok()
     .unwrap();
+    let runtime = PathBuf::from(env::var_os("CARGO_ONLINE_MIR_RUNTIME").unwrap());
+    // Cargo may give feature-specific units different dependency directories.
+    args.push(format!(
+        "-Ldependency={}",
+        runtime.parent().unwrap().display()
+    ));
     if selected {
         let out_dir = Path::new(&args[args.iter().position(|a| a == "--out-dir").unwrap() + 1]);
-        let runtime = PathBuf::from(env::var_os("CARGO_ONLINE_MIR_RUNTIME").unwrap());
         // Subsequent Cargo/rustdoc invocations find transitive rlibs in this directory.
         let dependency = out_dir.join(runtime.file_name().unwrap());
         match fs::hard_link(&runtime, &dependency) {
