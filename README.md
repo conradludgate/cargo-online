@@ -121,6 +121,21 @@ A disjoint four-candidate shard (`8192/16384`, round-robin) took 1,120.460 s. It
 
 The benchmark copy enabled the nightly test crate and provided the six header benches with the current `TypedHeader` trait under their expected name. It also used the pinned nightly's diagnostic text for the existing `case-warning.rs` compile-fail test. All six benches and the diagnostic test passed. The original and configured workspace produced byte-identical lists of all 67,884 candidates.
 
+#### Effect of loopback latency on the workspace run
+
+Rama's HTTP/2 integration test `h2::hammer::hammer_client_concurrency` creates 5,000 loopback connections. Using the same unmodified executable, two Tokio workers, and private Linux network namespaces, it passed in 168.66, 185.70 and 172.79 s with the default loopback route. With immediate TCP acknowledgements it passed in 2.45, 0.92 and 0.88 s. The workers used `ip route replace local 127.0.0.1/32 dev lo table local scope host src 127.0.0.1 quickack 1` inside the namespace after bringing up `lo`.
+
+The complete five-mutant control then used that loopback setting and `TOKIO_WORKER_THREADS=2`. The clean suite had the same named test results and all five mutation verdicts matched. The comparison below includes the unmutated suite, inactive bundle control and mutant executions under each configuration. Concurrent workloads and build-cache warmth differed between runs.
+
+| Five-mutant shard on pinned rustc | Host defaults | Tuned private loopback |
+|---|---:|---:|
+| Clean workspace test suite | 227.6 s | 76.4 s |
+| All test invocations | 1,157.60 s | 271.93 s |
+| Explicit Cargo builds | 270.91 s | 1,276.17 s |
+| End to end | 1,432.19 s | 1,557.51 s |
+
+The test phase was 76.5% shorter in the tuned run. Its cold build used four Cargo jobs and dominated total elapsed time. The host control used 12 Cargo jobs and existing dependency artifacts. These trials measure workspace test costs and do not establish a compiler speedup.
+
 ### Rustyguard benchmark
 
 #### Full cargo-mutants catalog
