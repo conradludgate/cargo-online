@@ -72,6 +72,23 @@ cargo online mutate --lib -j3 --timeout 45 --build-timeout 600 -- \
   --sharding round-robin --shard 0/64
 ```
 
+#### Downstream workspace tests
+
+A separate five-candidate shard used the full Rama workspace suite, including integration tests and doctests. The unfiltered run spent 1,128 s in test invocations and 289 s in builds. It killed two mutants, found two unviable and left one survivor. Workspace coverage identified that survivor as uncovered, killed the `rama-net` edit with library tests, and caught the `rama-utils` edit through full-suite fallback. Cargo-mutants confirmed the last kill in the `NonEmptyVec::binary_search_by_key` doctest.
+
+| Runner | Elapsed seconds | Clean baseline |
+|---|---:|---|
+| cargo-online, full workspace | 1,420.673 | Whole workspace |
+| cargo-online, workspace coverage | 995.725, 1,015.167 | Whole workspace |
+| cargo-mutants 27.1.0 | 1,002.611 | Five mutated packages |
+
+Runs used one mutation worker, 12 Cargo build jobs, an existing dependency cache, fresh source snapshots, default features, disabled dev/test debug info, and local socket access. Both completed coverage runs matched every named outcome after counting uncovered mutants as survivors. An additional attempt stopped in the unmodified baseline when a Rama CLI test encountered a loopback port collision. That test passed in isolation and the unchanged full retry completed. The sample shows a 28.5–29.9% saving against unfiltered cargo-online. The two coverage timings bracket the cargo-mutants result. Reproduce the two cargo-online modes from the Rama workspace root:
+
+```sh
+cargo online mutate --test-workspace -j1 --build-timeout 1200 -- --sharding round-robin --shard 0/16384
+cargo online mutate --test-workspace --workspace-coverage -j1 --build-timeout 1200 -- --sharding round-robin --shard 0/16384
+```
+
 ### Rustyguard benchmark
 
 #### Full cargo-mutants catalog
