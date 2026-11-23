@@ -374,6 +374,7 @@ fn transform(tcx: TyCtxt<'_>, def: LocalDefId) -> &Body<'_> {
 }
 struct Callbacks {
     instrument: bool,
+    build_script: bool,
 }
 impl rustc_driver::Callbacks for Callbacks {
     fn after_analysis<'tcx>(
@@ -418,16 +419,20 @@ impl rustc_driver::Callbacks for Callbacks {
                         .ok()
                 })
                 .collect();
-            if !self.instrument {
-                // Cargo may reuse this foreign unit for many subsequent plans.
-                // Record every candidate source it loaded, including sites
-                // that only appear in a later batch.
-                let index = PathBuf::from(env::var_os("CARGO_ONLINE_MIR_SOURCE_INDEX").unwrap());
-                let flags = index.parent().unwrap().join("foreign");
-                for (n, bytes) in fs::read(index).unwrap().split(|&b| b == 0).enumerate() {
-                    if files.contains(Path::new(std::ffi::OsStr::from_bytes(bytes))) {
-                        fs::write(flags.join(n.to_string()), []).unwrap();
-                    }
+            // A reused unit can load the source of a later package's candidate.
+            // A build script is always foreign, including for its own package.
+            let index = PathBuf::from(env::var_os("CARGO_ONLINE_MIR_SOURCE_INDEX").unwrap());
+            let flags = index.parent().unwrap().join("foreign");
+            let package = env::var("CARGO_PKG_NAME").unwrap_or_default();
+            let bytes = fs::read(index).unwrap();
+            let mut fields = bytes.split(|&b| b == 0);
+            for n in 0.. {
+                let Some(path) = fields.next() else { break };
+                let Some(owner) = fields.next() else { break };
+                if (self.build_script || owner != package.as_bytes())
+                    && files.contains(Path::new(std::ffi::OsStr::from_bytes(path)))
+                {
+                    fs::write(flags.join(n.to_string()), []).unwrap();
                 }
             }
             if self.instrument {
@@ -455,18 +460,18 @@ impl rustc_driver::Callbacks for Callbacks {
         rustc_driver::Compilation::Continue
     }
     fn config(&mut self, c: &mut rustc_interface::Config) {
-        if !self.instrument {
-            return;
-        }
         if !PLAN.get().unwrap().dev {
             c.track_state = Some(Box::new(|sess| {
-                let name = "CARGO_ONLINE_MIR_PLAN";
-                let plan = env::var(name).unwrap();
+                let name = format!("CARGO_ONLINE_PLAN_{}", env::var("CARGO_PKG_NAME").unwrap());
+                let plan = env::var(&name).ok();
                 sess.env_depinfo.borrow_mut().insert((
-                    rustc_span::Symbol::intern(name),
-                    Some(rustc_span::Symbol::intern(&plan)),
+                    rustc_span::Symbol::intern(&name),
+                    plan.as_deref().map(rustc_span::Symbol::intern),
                 ));
             }));
+        }
+        if !self.instrument {
+            return;
         }
         c.override_queries = Some(|_, p| {
             ORIGINAL.set(p.queries.optimized_mir).unwrap();
@@ -500,14 +505,15 @@ fn main() -> ExitCode {
     }
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     let dev = env::var_os("CARGO_ONLINE_MIR_DEV").is_some();
+    let build_script = args
+        .windows(2)
+        .any(|a| a[0] == "--crate-name" && a[1] == "build_script_build");
     let owner = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from)
         == env::var_os("CARGO_ONLINE_MIR_PACKAGE").map(PathBuf::from)
         && env::var_os("CARGO_ONLINE_MIR_PACKAGE").is_some()
         && args.iter().any(|s| s == "--out-dir")
         && (!dev || args.iter().any(|s| s == "--test"))
-        && !args
-            .windows(2)
-            .any(|a| a[0] == "--crate-name" && a[1] == "build_script_build");
+        && !build_script;
     let selected = if dev {
         args.iter().any(|a| a == "--test")
             && env::var_os("CARGO_ONLINE_MIR_SOURCES").is_some_and(|sources| {
@@ -598,6 +604,7 @@ fn main() -> ExitCode {
             &args,
             &mut Callbacks {
                 instrument: selected,
+                build_script,
             },
         )
     });

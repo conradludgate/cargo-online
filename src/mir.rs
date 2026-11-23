@@ -15,24 +15,30 @@ pub struct Toolchain {
     runtime: String,
     libraries: std::ffi::OsString,
 }
-/// The wrapper identity and source index stay fixed for one package in one session.
-pub struct PackageDriver {
+/// The wrapper identity and candidate source index stay fixed across the workspace session.
+pub struct SessionDriver {
     directory: tempfile::TempDir,
-    files: Vec<PathBuf>,
+    files: Vec<(PathBuf, String)>,
 }
 
-impl PackageDriver {
-    pub fn new(compiler: &Toolchain, temp: &Path, paths: BTreeSet<PathBuf>) -> Result<Self> {
+impl SessionDriver {
+    pub fn new(
+        compiler: &Toolchain,
+        temp: &Path,
+        paths: BTreeSet<(PathBuf, String)>,
+    ) -> Result<Self> {
         let directory = tempfile::tempdir_in(temp)?;
         fs::hard_link(compiler.wrapper(), directory.path().join("rustc"))?;
         let files: BTreeSet<_> = paths
             .into_iter()
-            .map(fs::canonicalize)
+            .map(|(path, owner)| fs::canonicalize(path).map(|path| (path, owner)))
             .collect::<std::io::Result<_>>()?;
         let files: Vec<_> = files.into_iter().collect();
         let mut index = Vec::new();
-        for path in &files {
+        for (path, owner) in &files {
             index.extend_from_slice(path.as_os_str().as_encoded_bytes());
+            index.push(0);
+            index.extend_from_slice(owner.as_bytes());
             index.push(0);
         }
         fs::write(directory.path().join("sources"), index)?;
@@ -44,11 +50,11 @@ impl PackageDriver {
         self.directory.path()
     }
 
-    pub fn used_by_another_unit(&self, path: &Path) -> Result<bool> {
+    pub fn used_by_another_unit(&self, path: &Path, package: &str) -> Result<bool> {
         let path = path.canonicalize()?;
         let index = self
             .files
-            .binary_search(&path)
+            .binary_search_by(|(file, owner)| (file, owner.as_str()).cmp(&(&path, package)))
             .map_err(|_| anyhow::anyhow!("unindexed MIR source {}", path.display()))?;
         Ok(self
             .path()

@@ -99,7 +99,7 @@ struct Baseline {
 struct Engine<'a> {
     compiler: Option<&'a crate::mir::Toolchain>,
     plan: Option<&'a Path>,
-    package_driver: Option<&'a crate::mir::PackageDriver>,
+    session_driver: Option<&'a crate::mir::SessionDriver>,
     libraries_first: bool,
     timeout: Duration,
     options: &'a Options,
@@ -138,7 +138,7 @@ impl Engine<'_> {
         let mut c = cargo();
         if let Some(tc) = self.compiler {
             tc.compiler(&mut c);
-            if let (Some(plan), Some(driver)) = (self.plan, self.package_driver) {
+            if let (Some(plan), Some(driver)) = (self.plan, self.session_driver) {
                 tc.instrument(
                     &mut c,
                     &driver.path().join("rustc"),
@@ -146,6 +146,10 @@ impl Engine<'_> {
                     &plan.join("report"),
                 );
                 c.env("CARGO_ONLINE_MIR_PLAN", plan.join("sites"))
+                    .env(
+                        format!("CARGO_ONLINE_PLAN_{}", self.package),
+                        plan.join("sites"),
+                    )
                     .env(
                         "CARGO_ONLINE_MIR_SOURCE_INDEX",
                         driver.path().join("sources"),
@@ -508,7 +512,7 @@ impl Engine<'_> {
         Ok(results)
     }
     fn mir_batch(&self, ids: &[usize], report: &mut Report) -> Result<Vec<usize>> {
-        let Some(driver) = self.package_driver else {
+        let Some(driver) = self.session_driver else {
             return Ok(ids.to_vec());
         };
         let (mut native, source): (Vec<_>, Vec<_>) = ids.iter().copied().partition(|&id| {
@@ -526,7 +530,7 @@ impl Engine<'_> {
             .iter()
             .filter_map(|&id| self.catalog.mir_site(self.root, id, &insertions))
             .collect();
-        // Keep plan names unique until the package finishes. Rustc emits the
+        // Keep plan names unique until the session finishes. Rustc emits the
         // name as a tracked environment dependency of each instrumented unit.
         let dir = tempfile::tempdir_in(driver.path())?.keep();
         fs::write(dir.join("sites"), sites.join("\n"))?;
@@ -579,7 +583,9 @@ impl Engine<'_> {
             matched.extend(counts.into_keys());
         }
         for &id in &attempted {
-            if driver.used_by_another_unit(&self.root.join(&self.catalog.edits[id].file))? {
+            if driver
+                .used_by_another_unit(&self.root.join(&self.catalog.edits[id].file), self.package)?
+            {
                 foreign.insert(id);
             }
         }
@@ -794,6 +800,17 @@ pub fn run(options: Options) -> Result<bool> {
         .as_ref()
         .map(|c| crate::mir::Toolchain::prepare(c, &cache))
         .transpose()?;
+    let session_driver = compiler
+        .as_ref()
+        .map(|tc| {
+            let paths = catalog
+                .edits
+                .iter()
+                .map(|edit| (root.join(&edit.file), edit.package.clone()))
+                .collect();
+            crate::mir::SessionDriver::new(tc, temp.path(), paths)
+        })
+        .transpose()?;
     let mut workspace_baseline = None;
     let route_path = {
         use std::hash::{Hash, Hasher};
@@ -828,7 +845,7 @@ pub fn run(options: Options) -> Result<bool> {
         let mut engine = Engine {
             compiler: compiler.as_ref(),
             plan: None,
-            package_driver: None,
+            session_driver: session_driver.as_ref(),
             libraries_first: false,
             timeout: options
                 .timeout
@@ -873,18 +890,6 @@ pub fn run(options: Options) -> Result<bool> {
         let (runtime, mut literal): (Vec<_>, Vec<_>) = ids.into_iter().partition(|&i| {
             catalog.bundleable(i) && !host_code && !report.routes.literal.contains(&i)
         });
-        let package_driver = if let Some(tc) = &compiler
-            && !runtime.is_empty()
-        {
-            let paths = runtime
-                .iter()
-                .map(|&id| root.join(&catalog.edits[id].file))
-                .collect();
-            Some(crate::mir::PackageDriver::new(tc, temp.path(), paths)?)
-        } else {
-            None
-        };
-        engine.package_driver = package_driver.as_ref();
         eprintln!(
             "{}: {} catalog candidates",
             package,

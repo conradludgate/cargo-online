@@ -635,7 +635,7 @@ fn successive_mir_batches_reuse_unrelated_units_and_remember_foreign_sources() {
         "[package]\nname='foreign'\nversion='0.1.0'\nedition='2024'",
     )
     .unwrap();
-    fs::write(root.join("foreign/src/lib.rs"), "#[path=\"../../src/shared.rs\"] mod shared;\n#[test] fn check() { assert!(shared::f(3)); }").unwrap();
+    fs::write(root.join("foreign/src/lib.rs"), format!("#[path=\"../../src/shared.rs\"] mod shared;\n{line}\n#[test] fn check() {{ assert!(f(3) && shared::f(3)); }}")).unwrap();
     fs::create_dir_all(root.join("unrelated/src")).unwrap();
     fs::write(
         root.join("unrelated/Cargo.toml"),
@@ -644,8 +644,19 @@ fn successive_mir_batches_reuse_unrelated_units_and_remember_foreign_sources() {
     .unwrap();
     fs::write(root.join("unrelated/src/lib.rs"), "#[test] fn passes() {}").unwrap();
     let column = line.find("==").unwrap() + 1;
-    let catalog: Vec<_> = [("first", "src/lib.rs", 2, "!="), ("foreign", "src/shared.rs", 1, "!="), ("last","src/lib.rs",2,"<")]
-        .map(|(name,file,row,replacement)| json!({"name":name,"package":"sample","file":file,"replacement":replacement,"span":{"start":{"line":row,"column":column},"end":{"line":row,"column":column+2}}})).into();
+    let catalog: Vec<_> = [
+        ("foreign", "other owner", "foreign/src/lib.rs", 2, "!="),
+        ("sample", "first", "src/lib.rs", 2, "!="),
+        ("sample", "foreign", "src/shared.rs", 1, "!="),
+        ("sample", "last", "src/lib.rs", 2, "<"),
+    ]
+    .map(|(package, name, file, row, replacement)| {
+        json!({
+            "name":name, "package":package, "file":file, "replacement":replacement,
+            "span":{"start":{"line":row,"column":column},"end":{"line":row,"column":column+2}}
+        })
+    })
+    .into();
     fs::write(
         root.join("catalog.json"),
         serde_json::to_vec(&catalog).unwrap(),
@@ -683,12 +694,12 @@ exec "$@"
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(output.status.success(), "{log}");
-    assert_eq!(log.matches("1 native MIR edits").count(), 2, "{log}");
+    assert_eq!(log.matches("1 native MIR edits").count(), 3, "{log}");
     assert!(
-        log.contains("2 in 2 shared builds, 1 literal builds"),
+        log.contains("3 in 3 shared builds, 1 literal builds"),
         "{log}"
     );
-    for name in ["first", "foreign", "last"] {
+    for name in ["other owner", "first", "foreign", "last"] {
         assert!(log.contains(&format!("Killed\t{name}")), "{log}");
     }
     let plans = fs::read_to_string(witness).unwrap();
@@ -702,7 +713,7 @@ exec "$@"
             .map(|(_, plan)| plan)
             .collect::<std::collections::BTreeSet<_>>()
     };
-    assert!((1..3).contains(&compiled("foreign").len()), "{plans}");
+    assert!((2..4).contains(&compiled("foreign").len()), "{plans}");
     assert_eq!(compiled("unrelated").len(), 1, "{plans}");
 }
 
